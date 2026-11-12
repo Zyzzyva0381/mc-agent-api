@@ -1,0 +1,16 @@
+{
+  "http": { "host": "0.0.0.0", "port": 18900, "trustProxyHeaders": true },
+  "minecraft": { "host": "mc.example.com", "port": 25565, "version": "1.21.11" },
+  "session": { "tokenTtlHours": 24 },
+  "auth": {
+    "type": "yggdrasil",
+    "authServer": "https://skin.example.com/api/yggdrasil/authserver",
+    "sessionServer": "https://skin.example.com/api/yggdrasil/sessionserver"
+  },
+  "readiness": {
+    "type": "proxy",
+    "server": "survival",
+    "minAdvancements": 20,
+    "rcon": { "host": "10.0.0.6", "port": 25575, "passwordFile": ".rcon-pass" }
+  }
+}
