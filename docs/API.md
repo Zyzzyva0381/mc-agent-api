@@ -484,6 +484,8 @@ POST /attack  {"entity_id": 812, "max_hits": 5, "interval_ms": 300}
 - `max_hits`：打够这么多下立刻返回，用于"砍一下就走"（风筝苦力怕、单次敲击）；
 - `interval_ms`：手动覆盖挥击间隔（50–5000）。
 
+`/attack` 会自动寻路贴近、自动瞄准、自动换上剑/斧。需要自己控制方向、站位和节奏（跳劈暴击、隔缝挥砍、朝固定方向打）时，改用 `POST /control {"hit": ...}`，见 §4.16。
+
 
 ```
 POST /attack  {"entity_id": 12345, "timeout": 20000}
@@ -667,27 +669,38 @@ POST /stop
 
 ```
 POST /control  {"forward": true, "jump": true, "yaw": 1.57, "ms": 400}
+POST /control  {"hit": true, "yaw": 1.57, "pitch": -0.2}
+POST /control  {"jump": true, "hit": 1, "hit_interval_ms": 450, "ms": 500}
 ```
 
 不经过 mineflayer-pathfinder 的原生按键控制：后端 `setControlState` 按住指定键 `ms` 毫秒后自动松开，返回位移。用于 A* 处理不了的中间态：
 
 - 下船后站在船体碰撞箱顶上（`on_ground:false`、`in_water:false`，寻路会永久死锁）——按 200ms 方向键即可脱离；
 - 水里上浮 / 贴岸、助跑跳沟、原地 `jump` 配合 `place` 垫高；
-- 微调站位（对齐箱子、漏斗、农田）。
+- 微调站位（对齐箱子、漏斗、农田）；
+- **朝指定方向挥砍**（`hit`）：不寻路、不自动瞄准、不换武器，按当前视线点左键——用于跳劈暴击、打船 / 矿车 / 末影水晶、隔着方块缝挥砍、自己控制节奏的走位战斗。
 
 | 参数 | 说明 |
 |---|---|
 | `forward` / `back` / `left` / `right` | 方向键，布尔 |
 | `jump` / `sneak` / `sprint` | 跳跃 / 潜行 / 疾跑，布尔 |
-| `yaw` / `pitch` | 可选，弧度（mineflayer 约定，0 朝 -Z），先转向再走 |
-| `ms` | 按住时长，50–3000，默认 300 |
+| `yaw` / `pitch` | 可选，弧度（mineflayer 约定，0 朝 -Z），先转向再走 / 再挥 |
+| `hit` | 可选，`true` = 挥 1 下，整数 1–20 = 挥 N 下；第一下在开始时立即挥出 |
+| `hit_interval_ms` | 两下之间的间隔，50–5000；默认按手持物品的原版攻击冷却（空手 250 / 剑 625 / 镐 833 / 斧·锹·锄 1000 / 三叉戟 909，其它 500）。比冷却短也会照发，但原版伤害会按冷却进度打折 |
+| `ms` | 按住时长，50–3000；默认 300，只给 `hit` 时默认刚好够挥完（`(hit-1)×间隔+50`）。给了 `ms` 但不够挥完会返回 `bad_args`（附 `required_ms`） |
+
+方向键和 `hit` 至少给一个。每一下按原版左键判定：从眼睛沿视线找 **3 格**内最近的实体判定箱（被方块挡住的不算；掉落物、经验球、箭等原版打不到的实体会跳过；船、矿车、末影水晶都能打到），命中就攻击，否则只挥手——**不会挖方块**，挖掘请用 `/dig`。`hits[].entity` 只说明攻击包发给了谁，伤害由服务端按原版规则结算：同一目标受击后有 0.5 秒无敌帧（间隔 < 500ms 时中间那几下通常不掉血），冷却没转满伤害打折，下落中命中才是暴击。
 
 ```json
-{"ok": true, "result": {"ms": 402, "pos": [443.8, 63.4, 218.5], "moved": 0.42,
-  "on_ground": true, "in_water": false, "yaw": 1.57}}
+{"ok": true, "result": {"ms": 52, "pos": [443.8, 63.4, 218.5], "moved": 0,
+  "on_ground": true, "in_water": false, "yaw": 1.57, "pitch": -0.2,
+  "hits": [{"t_ms": 0, "entity": {"id": 812, "name": "zombie", "dist": 2.41}}],
+  "hit_interval_ms": 625, "held": "iron_sword"}}
 ```
 
-动作锁语义与其它动作一致（会抢占 `busy`）；结束时会重放当前 `/posture`。
+没命中时那一下是 `{"t_ms": 0, "entity": null, "block": {"name": "stone", "pos": [445, 63, 218]}}`（视线 3 格内没有方块则没有 `block`）。
+
+动作锁语义与其它动作一致（会抢占 `busy`，默认 `stop_on` 含 `hurt`——近身对打时建议传 `"stop_on": []`）；结束时会重放当前 `/posture`。
 
 ### 4.17 主动转向
 
@@ -777,6 +790,7 @@ curl -s -X POST http://127.0.0.1:18900/api/v1/posture \
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 1.3.3 | 2026-11-12 | `POST /control` 新增 `hit`（按当前视线原版左键，可连挥 N 下）与 `hit_interval_ms`；结果新增 `pitch`、`hits`、`hit_interval_ms`、`held` |
 | 1.3.2 | 2026-11-12 | 钓鱼咬钩判定修正（只在浮标入水后判定，基准取最近 1 秒最高点），误判自动重抛，结果新增 `casts`、`false_bites`，没钓到改返回 `timeout`；`hurt` 事件新增 `source`、`source_entity`；`interrupted` 错误保留原始错误的附加字段与 `inner_code` |
 | 1.3.1 | 2026-11-03 | `POST /move_to` 支持骑乘掌舵：`status.in_vehicle` 非空时自动切载具模式（客户端权威，逐帧 `vehicle_move`），船 8 / 炽足兽 4 / 猪 5 / 马 9 格每秒，返回 `drove`、`vehicle`、`dist` |
 | 1.3 | 2026-11-02 | 统一 `{ok,ms,result}` 封装与 `pos` 命名；`/interact` 支持实体；新增 `/use_item`（吸收 `/consume`）、`/posture`、`/dismount`；`/place` 自动潜行；`/status` 补齐效果、着火、水中、载具、姿态、护甲、经验进度等字段；事件流改为 `seq` |

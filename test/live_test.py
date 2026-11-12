@@ -969,6 +969,82 @@ def t_primitives():
     return out
 
 
+@test("control_hit")
+def t_control_hit():
+    """/control 的 hit：按给定 yaw/pitch 原版左键，不寻路、不自动瞄准。
+    命中牛（扣血）、背对时挥空且不挖方块、能打到 type=object 的船、参数校验。"""
+    import math
+    clean_player()
+    goto_home()
+    x, y, z = pos_of()
+    rcon("kill @e[type=!player]")
+    rcon(f"clear {USER}")
+    out = {}
+
+    def aim(target_pos, height):
+        st = status()
+        ex, ey, ez = st["pos"][0], st["pos"][1] + 1.62, st["pos"][2]
+        dx, dy, dz = target_pos[0] - ex, target_pos[1] + height - ey, target_pos[2] - ez
+        return math.atan2(-dx, -dz), math.atan2(dy, math.hypot(dx, dz))
+
+    try:
+        # 1) 牛在正东 2 格：3 下都要打在牛身上，且牛掉血（NoAI 免得它被打跑）
+        rcon(f"summon cow {x + 2.5} {y} {z + 0.5} {{NoAI:1b,PersistenceRequired:1b}}")
+        time.sleep(1.0)
+        cows = ok("get_entities", {"radius": 6, "types": ["cow"]})["entities"]
+        check(cows, "cow not visible")
+        cow = cows[0]
+        yaw, pitch = aim(cow["pos"], 0.7)
+        r = ok("control", {"hit": 3, "yaw": yaw, "pitch": pitch, "stop_on": []})
+        out["cow"] = {"hits": r["hits"], "interval": r["hit_interval_ms"], "ms": r["ms"]}
+        check(len(r["hits"]) == 3, f"expected 3 swings: {r}")
+        check(r["hit_interval_ms"] == 250, f"fist interval should be 250: {r['hit_interval_ms']}")
+        check(all(h["entity"] and h["entity"]["id"] == cow["id"] for h in r["hits"]), f"not every swing hit the cow: {r['hits']}")
+        check(r["moved"] < 0.3, f"hit-only control moved the bot: {r['moved']}")
+        time.sleep(0.6)
+        # 客户端拿不到生物血量，问服务端（牛满血 10）
+        raw = rcon("data get entity @e[type=cow,limit=1,sort=nearest] Health")
+        m = __import__("re").search(r"([0-9.]+)f?\s*$", raw.strip())
+        hp = float(m.group(1)) if m else None
+        out["cow"]["health_after"] = hp
+        check(hp is not None and hp < 10, f"cow health did not drop (server says: {raw!r})")
+
+        # 2) 背对牛：挥空，且脚下 / 面前方块不被挖
+        r = ok("control", {"hit": True, "yaw": yaw + math.pi, "pitch": 0.6})
+        miss = r["hits"][0]
+        out["miss"] = miss
+        check(miss["entity"] is None, f"facing away still hit something: {miss}")
+        if miss.get("block"):
+            bp = miss["block"]["pos"]
+            check(block_at(*bp)["name"] == miss["block"]["name"], "a miss dug the block it looked at")
+        rcon("kill @e[type=cow]")
+
+        # 3) 船是 type=object，mineflayer 的 entityAtCursor 会漏掉；这里必须打得到
+        rcon(f"summon oak_boat {x + 0.5} {y} {z + 2.5}")
+        time.sleep(1.0)
+        boats = ok("get_entities", {"radius": 6, "types": ["oak_boat"]})["entities"]
+        check(boats, "boat not visible")
+        yaw, pitch = aim(boats[0]["pos"], 0.3)
+        r = ok("control", {"hit": 8, "yaw": yaw, "pitch": pitch, "stop_on": []})
+        hit_ids = [h["entity"]["id"] for h in r["hits"] if h["entity"]]
+        out["boat"] = {"hits_on_boat": hit_ids.count(boats[0]["id"]), "swings": len(r["hits"])}
+        check(hit_ids and hit_ids[0] == boats[0]["id"], f"first swing did not hit the boat: {r['hits']}")
+        time.sleep(0.6)
+        out["boat"]["broken"] = not ok("get_entities", {"radius": 6, "types": ["oak_boat"]})["entities"]
+
+        # 4) 参数校验
+        for bad in ({"hit": 0}, {"hit": 21}, {"hit": "x"}, {"hit": 3, "hit_interval_ms": 1000, "ms": 500},
+                    {"hit_interval_ms": 300, "forward": True}):
+            p = http("control", bad)[1]
+            check(p.get("error", {}).get("code") == "bad_args", f"control {bad} -> {p}")
+        p = http("control", {"hit": 3, "hit_interval_ms": 1000, "ms": 500})[1]
+        check(p["error"].get("required_ms") == 2050, f"required_ms missing: {p['error']}")
+    finally:
+        rcon("kill @e[type=!player]")
+        clean_player()
+    return out
+
+
 @test("busy")
 def t_busy():
     goto_home()

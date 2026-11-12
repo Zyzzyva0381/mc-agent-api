@@ -592,6 +592,47 @@ async function goNear(s, pos, range, timeout = 60000) {
   } finally { if (s.bot) s.bot.removeListener('path_reset', onReset) }
 }
 
+// 原版左键：沿视线找 3 格内（生存模式实体交互距离，从眼睛算）最近的实体判定箱，被方块挡住的不算；
+// 命中就发攻击包 + 挥手，没命中只挥手（不挖方块，挖掘请用 /dig）。
+// 不用 mineflayer 的 entityAtCursor：它把 type=object 的实体（船、矿车、末影水晶）全滤掉了，且距离从脚底算。
+const HIT_REACH = 3.0
+const UNHITTABLE = new Set(['item', 'experience_orb', 'arrow', 'spectral_arrow', 'trident', 'fishing_bobber', 'falling_block',
+  'area_effect_cloud', 'marker', 'eye_of_ender', 'ender_pearl', 'snowball', 'egg', 'potion', 'experience_bottle',
+  'firework_rocket', 'llama_spit', 'shulker_bullet', 'small_fireball', 'evoker_fangs', 'lightning_bolt', 'interaction',
+  'block_display', 'item_display', 'text_display'])
+function rayBox (o, d, min, max) {
+  let t0 = 0; let t1 = Infinity
+  for (const a of ['x', 'y', 'z']) {
+    if (Math.abs(d[a]) < 1e-9) { if (o[a] < min[a] || o[a] > max[a]) return null; continue }
+    let n = (min[a] - o[a]) / d[a]; let f = (max[a] - o[a]) / d[a]
+    if (n > f) [n, f] = [f, n]
+    t0 = Math.max(t0, n); t1 = Math.min(t1, f)
+    if (t0 > t1) return null
+  }
+  return t0
+}
+function leftClick (s) {
+  const b = s.bot
+  const me = b.entity
+  const eye = me.position.offset(0, me.eyeHeight || 1.62, 0)
+  const dir = new Vec3(-Math.sin(me.yaw) * Math.cos(me.pitch), Math.sin(me.pitch), -Math.cos(me.yaw) * Math.cos(me.pitch))
+  const block = b.blockAtCursor(HIT_REACH)
+  const limit = block && block.intersect ? eye.distanceTo(block.intersect) : HIT_REACH
+  let best = null; let bestT = limit
+  for (const e of Object.values(b.entities)) {
+    if (e === me || (b.vehicle && e === b.vehicle) || UNHITTABLE.has(e.name) || !e.position) continue
+    const w = (e.width || 0.6) / 2; const h = e.height || 1.8
+    const t = rayBox(eye, dir, e.position.offset(-w, 0, -w), e.position.offset(w, h, w))
+    if (t !== null && t <= bestT) { best = e; bestT = t }
+  }
+  if (best) {
+    b.attack(best)   // use_entity(attack) + swing
+    return { entity: { id: best.id, name: best.username || best.name, dist: +bestT.toFixed(2) } }
+  }
+  b.swingArm('right')
+  return { entity: null, ...(block ? { block: { name: block.name, pos: [block.position.x, block.position.y, block.position.z] } } : {}) }
+}
+
 function findItem(s, name) {
   const it = s.bot.inventory.items().find(i => i.name === name)
   if (!it) fail('missing_item', `no ${name} in inventory`, { inventory: invCounts(s.bot) })
@@ -2314,12 +2355,11 @@ const api = {
     s.bot.chat(message)
     return { sent: true }
   },
-  // 不经过 pathfinder 的原生键位控制：受控时长内按住指定方向/跳跃。
-  // 用于脱离船体碰撞箱、水中上浮、助跑跳沟、原地跳配合 place 垫高这类 A* 处理不了的中间态。
-  async control(s, { forward, back, left, right, jump, sneak, sprint, yaw, pitch, ms = 300 }) {
+  // 不经过 pathfinder 的原生键位控制：受控时长内按住指定方向/跳跃，可选在此期间按左键（hit）。
+  // 用于脱离船体碰撞箱、水中上浮、助跑跳沟、原地跳配合 place 垫高、跳劈暴击、朝固定方向挥砍
+  // 这类 A* / attack 处理不了的中间态。
+  async control(s, { forward, back, left, right, jump, sneak, sprint, yaw, pitch, ms, hit, hit_interval_ms }) {
     if (!s.bot || !s.bot.entity) fail('not_connected', 'bot not connected')
-    ms = Number(ms)
-    if (!Number.isFinite(ms) || ms < 50 || ms > 3000) fail('bad_args', 'ms must be between 50 and 3000')
     const keys = ['forward', 'back', 'left', 'right', 'jump', 'sneak', 'sprint']
     const want = {}
     for (const k of keys) {
@@ -2327,7 +2367,22 @@ const api = {
       if (v !== undefined && typeof v !== 'boolean') fail('bad_args', `${k} must be a boolean`)
       want[k] = v === true
     }
-    if (!keys.some(k => want[k])) fail('bad_args', 'set at least one of forward/back/left/right/jump/sneak/sprint')
+    let hits = 0
+    if (hit !== undefined && hit !== false) {
+      hits = hit === true ? 1 : Number(hit)
+      if (!Number.isInteger(hits) || hits < 1 || hits > 20) fail('bad_args', 'hit must be true or an integer between 1 and 20')
+    }
+    if (!keys.some(k => want[k]) && !hits) fail('bad_args', 'set at least one of forward/back/left/right/jump/sneak/sprint or hit')
+    let interval = 0
+    if (hits) {
+      interval = hit_interval_ms === undefined ? attackIntervalMs(s.bot.heldItem) : Number(hit_interval_ms)
+      if (!Number.isFinite(interval) || interval < 50 || interval > 5000) fail('bad_args', 'hit_interval_ms must be between 50 and 5000')
+    } else if (hit_interval_ms !== undefined) fail('bad_args', 'hit_interval_ms needs hit')
+    // 只给 hit 不给 ms：时长刚好够挥完 hits 下
+    const needMs = hits ? (hits - 1) * interval + 50 : 0
+    ms = ms === undefined ? Math.max(hits ? needMs : 300, 50) : Number(ms)
+    if (!Number.isFinite(ms) || ms < 50 || ms > 3000) fail('bad_args', 'ms must be between 50 and 3000')
+    if (hits && ms < needMs) fail('bad_args', `${hits} hits at ${interval}ms need ms >= ${needMs}`, { required_ms: needMs })
     if (yaw !== undefined || pitch !== undefined) {
       const ny = Number(yaw ?? s.bot.entity.yaw)
       const np = Number(pitch ?? s.bot.entity.pitch)
@@ -2336,9 +2391,17 @@ const api = {
     }
     const before = s.bot.entity.position.clone()
     const t0 = Date.now()
+    const swings = []
+    let nextHitAt = t0
     for (const k of keys) if (want[k]) s.bot.setControlState(k, true)
     try {
-      while (Date.now() - t0 < ms && !s.interruptedBy) await sleep(50)
+      while (Date.now() - t0 < ms && !s.interruptedBy) {
+        if (swings.length < hits && Date.now() >= nextHitAt) {
+          swings.push({ t_ms: Date.now() - t0, ...leftClick(s) })
+          nextHitAt += interval
+        }
+        await sleep(Math.max(5, Math.min(50, (swings.length < hits ? nextHitAt : t0 + ms) - Date.now())))
+      }
     } finally {
       for (const k of keys) { try { s.bot.setControlState(k, false) } catch {} }
       s.applyPosture()
@@ -2351,6 +2414,8 @@ const api = {
       on_ground: !!s.bot.entity.onGround,
       in_water: !!s.bot.entity.isInWater,
       yaw: +s.bot.entity.yaw.toFixed(2),
+      pitch: +s.bot.entity.pitch.toFixed(2),
+      ...(hits ? { hits: swings, hit_interval_ms: interval, held: s.bot.heldItem ? s.bot.heldItem.name : null } : {}),
       ...(s.interruptedBy ? { interrupted_by: s.interruptedBy } : {})
     }
   },
