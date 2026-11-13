@@ -1087,6 +1087,31 @@ def t_knockback():
     return out
 
 
+@test("entity_push")
+def t_entity_push():
+    """被重叠的实体挤开：原版由客户端自己算，mineflayer 没实现，1.3.5 及以前 bot 推不动。
+    NoAI 牛（自己不动）放在 bot 身边错开 0.35 格，3 s 内服务端位置要离开 > 0.3 格。"""
+    import math
+    import re
+    clean_player()
+    goto_home()
+    x, y, z = pos_of()
+    rcon("kill @e[type=cow]")
+    rcon(f"summon cow {x + 3.5} {y} {z + 0.5} {{NoAI:1b,PersistenceRequired:1b,Tags:[pushtest]}}")
+    time.sleep(1.0)
+    try:
+        p0 = [x + 3.5 + 0.25, y, z + 0.5 + 0.1]
+        rcon(f"tp {USER} {p0[0]} {p0[1]} {p0[2]}")
+        time.sleep(3)
+        p1 = [float(v) for v in re.findall(r"(-?\d+(?:\.\d+)?)d", rcon(f"data get entity {USER} Pos"))]
+        moved = round(math.hypot(p1[0] - p0[0], p1[2] - p0[2]), 3)
+        check(moved > 0.3, f"bot was not pushed out of the cow: moved {moved}")
+        return {"moved": moved}
+    finally:
+        rcon("kill @e[type=cow]")
+        goto_home()
+
+
 @test("busy")
 def t_busy():
     goto_home()

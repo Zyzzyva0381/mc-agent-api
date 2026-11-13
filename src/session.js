@@ -63,7 +63,7 @@ class Session {
 
   // 动作接口的总闸：连着、且就绪适配器确认已在目标服务器
   isReady () {
-    return !!this.bot && !!this.readiness.isReady()
+    return !!this.bot && !!this.worldReady && !!this.readiness.isReady()
   }
 
   hardReconnect (reason) {
@@ -135,6 +135,9 @@ class Session {
     s.advancementsReady = false
     s.advancementPackets = 0
     s.advancementsUpdatedAt = null
+    s.worldReady = false
+    s.worldGen = 0
+    s.lastEntitySpawnAt = 0
     s.bot = mineflayer.createBot({
       host: config.minecraft.host, port: config.minecraft.port, version: config.minecraft.version,
       profilesFolder: false, checkTimeoutInterval: 30000,
@@ -331,6 +334,56 @@ class Session {
       if (!s.bot) return
       s.bot.physicsEnabled = true
       s.log('PHYSICS enabled after chunks')
+    })
+    // ready 还要等周围的区块和实体到齐：服务端先发区块、再陆续发实体，
+    // 以前 ready 一变 true 就调 get_entities 常常拿到 []。每次（重新）进入一个后端世界都重新等：
+    // 区块到齐（最多 8 s）后，再等到 600 ms 内没有新实体出现（最多再 3 s）。
+    s.bot.on('entitySpawn', () => { s.lastEntitySpawnAt = Date.now() })
+    s.bot.on('login', () => { s.worldReady = false; s.worldGen++ })
+    s.bot.on('spawn', async () => {
+      if (s.worldReady) return
+      const bot = s.bot
+      const gen = s.worldGen
+      const t0 = Date.now()
+      try { await withTimeout(bot.waitForChunksToLoad(), 8000, 'chunk load') } catch (e) {}
+      const t1 = Date.now()
+      await sleep(300)
+      while (Date.now() - t1 < 3000 && Date.now() - s.lastEntitySpawnAt < 600) await sleep(100)
+      if (s.bot !== bot || gen !== s.worldGen || s.worldReady) return
+      s.worldReady = true
+      s.log('WORLD ready after', Date.now() - t0, 'ms, entities', Object.keys(bot.entities).length - 1)
+    })
+    // 被别的实体挤开：原版里这是客户端自己算的（服务端只推生物，不推玩家），
+    // prismarine-physics 没实现，bot 就成了推不动的柱子。照原版 Entity.push 每 tick 加一点水平速度。
+    const NOT_PUSHABLE = new Set(['item', 'experience_orb', 'marker', 'area_effect_cloud',
+      'item_frame', 'glow_item_frame', 'painting', 'leash_knot', 'end_crystal', 'evoker_fangs', 'lightning_bolt',
+      'block_display', 'item_display', 'text_display', 'interaction', 'falling_block', 'tnt', 'fishing_bobber'])
+    const LIVING_TYPES = new Set(['player', 'mob', 'hostile', 'passive', 'animal', 'ambient', 'water_creature', 'living'])
+    const pushable = e => !NOT_PUSHABLE.has(e.name) && (LIVING_TYPES.has(e.type) || /boat|raft|minecart/.test(e.name || ''))
+    s.bot.on('physicsTick', () => {
+      const bot = s.bot
+      const me = bot && bot.entity
+      if (!me || !bot.physicsEnabled || bot.vehicle || bot.isSleeping || bot.game.gameMode === 'spectator') return
+      const p = me.position
+      const h = me.height || 1.8
+      for (const id in bot.entities) {
+        const e = bot.entities[id]
+        if (e === me || !e.position || e.isValid === false || !pushable(e)) continue
+        if (e.vehicle === me || (me.passengers || []).includes(e)) continue
+        const reach = 0.3 + (e.width || 0.6) / 2
+        let dx = e.position.x - p.x
+        let dz = e.position.z - p.z
+        if (Math.abs(dx) >= reach || Math.abs(dz) >= reach) continue
+        if (e.position.y >= p.y + h || e.position.y + (e.height || 1.8) <= p.y) continue
+        let f = Math.max(Math.abs(dx), Math.abs(dz))
+        if (f < 0.01) continue
+        f = Math.sqrt(f)
+        const g = Math.min(1, 1 / f) * 0.05
+        dx = dx / f * g
+        dz = dz / f * g
+        me.velocity.x -= dx
+        me.velocity.z -= dz
+      }
     })
     s.bot.on('spawn', () => s.pushEvent('spawn', { pos: fmt(s.bot.entity.position) }))
     s.bot.on('messagestr', (m, pos) => {
@@ -666,8 +719,14 @@ const ATTACK_INTERVAL_MS = { sword: 625, axe: 1000, pickaxe: 833, shovel: 1000, 
 function attackIntervalMs (item) {
   if (!item) return 250
   if (item.name === 'trident') return 909
+  if (item.name === 'mace') return 1667
+  // 斧 / 锄的攻速随材质变（原版 1.21：木/石/铜斧 0.8、铁斧 0.9；石/铜锄 2.0、铁锄 3.0、钻石/下界合金锄 4.0）
+  const BY_NAME = { wooden_axe: 1250, stone_axe: 1250, copper_axe: 1250, iron_axe: 1111,
+    stone_hoe: 500, copper_hoe: 500, iron_hoe: 333, diamond_hoe: 250, netherite_hoe: 250 }
+  if (BY_NAME[item.name]) return BY_NAME[item.name]
   const m = /_(sword|axe|pickaxe|shovel|hoe)$/.exec(item.name || '')
-  return (m && ATTACK_INTERVAL_MS[m[1]]) || 500
+  // 非工具物品（方块、食物……）没有攻击速度修饰，和空手一样 4.0 次/秒
+  return (m && ATTACK_INTERVAL_MS[m[1]]) || 250
 }
 
 // 载具（船 / 炽足兽 / 猪 / 马）在 1.21 是"客户端权威"：实测 player_input 和
@@ -812,6 +871,34 @@ function solveProjectile(origin, target, physics) {
     }
   }
   return best
+}
+
+// 只听服务端发来的某一格方块变化（block_change / multi_block_change 原始包），
+// 不受 mineflayer 本地预测（挖完先把方块改成空气）的影响。state = 最后一次服务端给的状态 id，没收到为 null。
+function watchServerBlock(bot, pos) {
+  const k = pos.floored()
+  const w = { state: null }
+  const single = bot.supportFeature('usesMultiblockSingleLong')
+  const onOne = pk => {
+    if (pk.location && pk.location.x === k.x && pk.location.y === k.y && pk.location.z === k.z) w.state = pk.type
+  }
+  const onMulti = pk => {
+    const c = pk.chunkCoordinates
+    if (!c || c.x !== Math.floor(k.x / 16) || c.z !== Math.floor(k.z / 16) || c.y !== Math.floor(k.y / 16)) return
+    for (const r of pk.records || []) {
+      const bx = single ? (r >> 8) & 0x0f : (r.horizontalPos >> 4) & 0x0f
+      const bz = single ? (r >> 4) & 0x0f : r.horizontalPos & 0x0f
+      const by = single ? r & 0x0f : r.y
+      if (c.x * 16 + bx === k.x && c.y * 16 + by === k.y && c.z * 16 + bz === k.z) w.state = single ? r >> 12 : r.blockId
+    }
+  }
+  bot._client.on('block_change', onOne)
+  bot._client.on('multi_block_change', onMulti)
+  w.stop = () => {
+    bot._client.removeListener('block_change', onOne)
+    bot._client.removeListener('multi_block_change', onMulti)
+  }
+  return w
 }
 
 function projectileAim(bot, target, physics, velocity) {
@@ -1541,7 +1628,7 @@ const api = {
     return {
       username: b.username, pos: fmt(p), yaw: +e.yaw.toFixed(2),
       dimension: b.game.dimension, gamemode: b.game.gameMode,
-      health: b.health, food: b.food, saturation: +b.foodSaturation.toFixed(1),
+      health: b.health, food: b.food, saturation: +(b.foodSaturation || 0).toFixed(1),
       xp_level: b.experience.level, xp_progress: +((b.experience && b.experience.progress) || 0).toFixed(3),
       oxygen: b.oxygenLevel, armor_points: armorPoints(b),
       held: itemSummary(b.heldItem), offhand: itemSummary(b.inventory.slots[45]),
@@ -1743,13 +1830,34 @@ const api = {
     const harvestable = !block.harvestTools || Object.keys(block.harvestTools).some(id => s.bot.inventory.items().some(i => i.type === +id))
     const before = invCounts(s.bot)
     for (let i = 0; i < 20 && !s.bot.entity.onGround; i++) await sleep(50)
+    // mineflayer 挖完会先把本地方块改成空气（客户端预测），服务端拒绝时只回 ack、不发方块更新，
+    // 原版客户端靠 ack 回滚预测，mineflayer 不回滚 —— 以前这里读本地缓存会把"没挖掉"报成成功。
+    // 现在只认服务端发来的这一格的 block_change / multi_block_change。
+    const watch = watchServerBlock(s.bot, p)
+    const eye = s.bot.entity.position.offset(0, s.bot.entity.eyeHeight || 1.62, 0)
+    const reachDist = +eye.distanceTo(block.position.offset(0.5, 0.5, 0.5)).toFixed(2)
     const t0 = Date.now()
-    await withTimeout(s.bot.dig(block, true), 30000, 'dig').catch(e => { if (!s.interruptedBy) throw e })
-    if (s.interruptedBy) return {}
+    let after
+    try {
+      await withTimeout(s.bot.dig(block, true), 30000, 'dig').catch(e => { if (!s.interruptedBy) throw e })
+      if (s.interruptedBy) return {}
+      // 服务端判定挖得"太快"时会延后补完（还要几 tick），再加上来回延迟
+      const ping = (s.bot.player && s.bot.player.ping) || 0
+      const deadline = Date.now() + Math.min(6000, 1500 + 3 * ping)
+      while (Date.now() < deadline && (watch.state === null || watch.state === block.stateId)) await sleep(25)
+      after = watch.state
+    } finally {
+      watch.stop()
+    }
     const digMs = Date.now() - t0
-    await sleep(250)
-    const after = s.bot.blockAt(p)
-    if (after && after.name === block.name) fail('protected_region', `server reverted the dig of ${block.name} (spawn protection or plugin)`)
+    if (after === null || after === block.stateId) {
+      // 把本地的预测撤回成服务端的真实状态，后续 get_block / find_blocks 才不会被骗
+      try { s.bot._updateBlockState(block.position, block.stateId) } catch (e) {}
+      const diag = { pos: fmt(s.bot.entity.position), eye_dist: reachDist, on_ground: !!s.bot.entity.onGround, ping_ms: s.bot.player ? s.bot.player.ping : null }
+      if (after === block.stateId) fail('protected_region', `server reverted the dig of ${block.name} (protection, game mode or plugin)`, diag)
+      fail('dig_unconfirmed', `server did not confirm breaking ${block.name}; it is still there (usually: server thinks the bot is too far away / position out of sync)`, diag)
+    }
+    await sleep(100)
     if (collect) await collectDrops(s, p)
     const gained = {}
     for (const [k, v] of Object.entries(invCounts(s.bot))) if (v > (before[k] || 0)) gained[k] = v - (before[k] || 0)
