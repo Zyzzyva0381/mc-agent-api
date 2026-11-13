@@ -1,6 +1,6 @@
 {
   "name": "mc-agent-api",
-  "version": "1.3.3",
+  "version": "1.3.4",
   "description": "HTTP API that lets AI agents play Minecraft Java Edition through mineflayer bots (one isolated bot per login).",
   "main": "src/index.js",
   "bin": { "mc-agent-api": "src/index.js" },

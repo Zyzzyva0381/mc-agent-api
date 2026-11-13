@@ -34,7 +34,10 @@ RCON_PORT = int(os.environ.get("RCON_PORT", "25575"))
 USER = os.environ.get("MC_AGENT_USER", "Agent_1")
 
 Y = 100                     # 台面高度（脚踩 y=100）
-HOME = (10, 100, 10)        # 出生点格子
+# 测试区整体平移到远离世界出生点的深海上空（种子 48290986：出生点 (0,0) 森林，(-1248,-800) 一带是深海）
+OX = int(os.environ.get("MC_TEST_OX", "-1250"))
+OZ = int(os.environ.get("MC_TEST_OZ", "-800"))
+HOME = (OX + 10, 100, OZ + 10)  # 测试台中心格子
 TOKEN = None
 LOG = []
 
@@ -123,7 +126,14 @@ def _recv(sock):
     return struct.unpack("<ii", body[:8]), body[8:].rstrip(b"\x00").decode("utf-8", "replace")
 
 
+# 所有 @e[...] 选择器都限定在测试区（OX/OZ 周围 ±100 格、全高度），清实体不会波及真人玩家那边。
+# 难度 / 时间 / 天气 / 昼夜仍是全服设置：有真人在线时不要跑全量回归。
+AREA_SEL = f"x={OX - 90},y=-64,z={OZ - 90},dx=220,dy=384,dz=220"
+
+
 def rcon(cmd, timeout=25):
+    if "@e[" in cmd and "x=" not in cmd and "distance=" not in cmd:
+        cmd = cmd.replace("@e[", f"@e[{AREA_SEL},")
     with socket.create_connection((RCON_HOST, RCON_PORT), timeout=timeout) as s:
         s.sendall(_packet(1, 3, read_secret("RCON_PASSWORD", ".rcon-pass")))
         _recv(s)
@@ -196,8 +206,8 @@ def setup_base():
     # 而 mineflayer 在 1.21.11 回的 accept_teleportation 包会被服务端判为无法解码，直接把 bot 踢掉）
     tp(HOME[0] + 0.5, Y, HOME[2] + 0.5)
     time.sleep(1.5)
-    rcon(f"fill -4 {Y-1} -4 26 {Y-1} 26 stone")
-    rcon(f"fill -4 {Y} -4 26 {Y+10} 26 air")
+    rcon(f"fill {OX-4} {Y-1} {OZ-4} {OX+26} {Y-1} {OZ+26} stone")
+    rcon(f"fill {OX-4} {Y} {OZ-4} {OX+26} {Y+10} {OZ+26} air")
     rcon("kill @e[type=!player]")
     rcon("weather clear")
     rcon("difficulty peaceful")
@@ -304,13 +314,13 @@ def t_on_fire():
 @test("water")
 def t_water():
     # 角落挖一个 2 深的水池：y-1 和 y 是水，站进去头部在水里
-    rcon(f"fill 20 {Y-1} 20 22 {Y+1} 22 water")
-    tp(21.5, Y, 21.5)
-    wait_pos(21, 21)
+    rcon(f"fill {OX+20} {Y-1} {OZ+20} {OX+22} {Y+1} {OZ+22} water")
+    tp(OX + 21.5, Y, OZ + 21.5)
+    wait_pos(OX + 21, OZ + 21)
     time.sleep(1.0)
     st = status()
-    rcon(f"fill 20 {Y-1} 20 22 {Y+1} 22 air")
-    rcon(f"fill 20 {Y-1} 20 22 {Y-1} 22 stone")
+    rcon(f"fill {OX+20} {Y-1} {OZ+20} {OX+22} {Y+1} {OZ+22} air")
+    rcon(f"fill {OX+20} {Y-1} {OZ+20} {OX+22} {Y-1} {OZ+22} stone")
     tp(HOME[0] + 0.5, Y, HOME[2] + 0.5)
     wait_pos(HOME[0], HOME[2])
     settle(Y)
@@ -322,13 +332,13 @@ def t_water():
 @test("lava")
 def t_lava():
     rcon(f"effect give {USER} fire_resistance 30 1")
-    rcon(f"setblock 24 {Y} 24 lava")
-    tp(24.5, Y, 24.5)
-    wait_pos(24, 24)
+    rcon(f"setblock {OX+24} {Y} {OZ+24} lava")
+    tp(OX + 24.5, Y, OZ + 24.5)
+    wait_pos(OX + 24, OZ + 24)
     time.sleep(1.0)
     hot = status()["in_lava"]
     tp(HOME[0] + 0.5, Y, HOME[2] + 0.5)
-    rcon(f"setblock 24 {Y} 24 air")
+    rcon(f"setblock {OX+24} {Y} {OZ+24} air")
     rcon(f"effect clear {USER}")
     settle(Y)
     check(hot, "in_lava false while standing in lava")
@@ -495,7 +505,7 @@ def t_boat_stall():
     这时 pathfinder 以前会原地转圈、一直占着动作锁；现在 move_to 必须在看门狗时限内返回
     （成功或 stalled，绝不能拖到 timeout），且返回后动作锁已释放。"""
     goto_home()
-    ox, oz = 50, 50                  # 离石台 40 格，区块已随出生点加载
+    ox, oz = OX + 50, OZ + 50        # 离石台 40 格（视距内，区块随 bot 加载）
     r0 = 12
     # 玻璃外壳 + 内部 5 格深水，水面在 Y-1；岛是离中心 8 格的 2x2 石柱，顶面与水面齐平
     rcon(f"fill {ox-r0} {Y-6} {oz-r0} {ox+r0} {Y+6} {oz+r0} air")
@@ -564,7 +574,7 @@ def t_stall_hitbox():
     客户端以为能穿过去，服务端每次都把人拉回来，pathfinder 原地转圈。
     move_to 必须以 stalled 返回（不是拖到 timeout），动作锁释放，bot 不被踢。"""
     goto_home()
-    x0, x1, zc = 12, 24, 2
+    x0, x1, zc = OX + 12, OX + 24, OZ + 2
     rcon(f"fill {x0} {Y} {zc-1} {x1} {Y+2} {zc+1} stone")
     rcon(f"fill {x0+1} {Y} {zc} {x1-1} {Y+1} {zc} air")
     rcon("kill @e[type=oak_boat]")
@@ -612,11 +622,11 @@ def t_strider_drive():
     rcon(f"fill {lx-2} {ty+1} {z-1} {lx-1} {ty+1} {z+1} stone")  # 站台
     rcon("kill @e[type=strider]")
     time.sleep(0.3)
-    rcon(f"summon strider {lx+0.5} {ty+1} {z}.5")
+    rcon(f"summon strider {lx+0.5} {ty+1} {z+0.5}")
     time.sleep(1.0)
     ents = ok("get_entities", {"radius": 16, "types": ["strider"]})["entities"]
     check(ents, f"summoned strider not visible at {lx}")
-    rcon(f"tp {USER} {lx-1.5} {ty+1} {z}.5")
+    rcon(f"tp {USER} {lx-1.5} {ty+1} {z+0.5}")
     time.sleep(0.8)
     # 炽足兽要先上鞍才能骑（和猪一样），再右键上兽
     give("saddle")
@@ -780,7 +790,9 @@ def t_sleep():
     check(status()["is_sleeping"], "status.is_sleeping false")
     r2 = ok("interact", {"x": cell[0], "y": cell[1], "z": cell[2]})
     check(r2.get("woke"), f"did not wake: {r2}")
-    for _ in range(24):
+    # 只给 1.5 s：只有 bot 一个人在线时，全员入睡 100 tick（5 s）后服务端会跳夜把人叫醒，
+    # 等太久就分不清是起床包生效还是跳夜（1.3.3 及以前起床包无效，就是这样被掩盖的）
+    for _ in range(6):
         if not status()["is_sleeping"]:
             break
         time.sleep(0.25)
@@ -798,35 +810,35 @@ def t_sleep():
 def t_bridge():
     by = 120
     # 先把区块加载出来再 fill，否则清理不掉上一轮留下的桥
-    tp(40.5, by + 8, 0.5)
-    wait_pos(40, 0)
+    tp(OX + 40.5, by + 8, OZ + 0.5)
+    wait_pos(OX + 40, OZ)
     time.sleep(2.0)
     for _ in range(3):
-        rcon(f"fill 37 {by-3} -7 43 {by+6} 9 air")
+        rcon(f"fill {OX+37} {by-3} {OZ-7} {OX+43} {by+6} {OZ+9} air")
         time.sleep(0.6)
-        if block_at(40, by - 1, -1)["name"] == "air":
+        if block_at(OX + 40, by - 1, OZ - 1)["name"] == "air":
             break
-    rcon(f"setblock 40 {by-1} 0 stone")
-    tp(40.5, by, 0.5)
-    wait_pos(40, 0)
+    rcon(f"setblock {OX+40} {by-1} {OZ} stone")
+    tp(OX + 40.5, by, OZ + 0.5)
+    wait_pos(OX + 40, OZ)
     settle(by)
-    check(block_at(40, by - 1, 0)["name"] == "stone", "bridge start block missing")
+    check(block_at(OX + 40, by - 1, OZ)["name"] == "stone", "bridge start block missing")
     give("cobblestone", "cobblestone", "cobblestone")
     ok("posture", {"sneak": True})
     # 连续往前铺 3 格再走过去：验证潜行在多次调用之间保持、且不会从桥上掉下去
     built = []
     for i in (1, 2, 3):
-        tgt = (40, by - 1, -i)
+        tgt = (OX + 40, by - 1, OZ - i)
         b = block_at(*tgt)
         check(b["name"] == "air", f"bridge cell {tgt} not empty: {b['name']}")
         built.append(ok("place", {"item": "cobblestone", "x": tgt[0], "y": tgt[1], "z": tgt[2]}))
         check(status()["sneaking"], "sneak dropped during bridging")
     ok("move_to", {"x": 40, "z": -3, "range": 0.7})
     st = status()
-    check(abs(st["pos"][2] + 3) < 1.0, f"bot did not walk out on the bridge: z={st['pos'][2]}")
+    check(abs(st["pos"][2] - OZ + 3) < 1.0, f"bot did not walk out on the bridge: z={st['pos'][2]}")
     check(abs(st["pos"][1] - by) < 1.2, f"bot fell off the bridge: y={st['pos'][1]}")
     ok("posture", {})
-    rcon(f"fill 36 {by-3} -6 44 {by+6} 8 air")
+    rcon(f"fill {OX+36} {by-3} {OZ-6} {OX+44} {by+6} {OZ+8} air")
     tp(HOME[0] + 0.5, Y, HOME[2] + 0.5)
     wait_pos(HOME[0], HOME[2])
     settle(Y)
@@ -836,7 +848,7 @@ def t_bridge():
 @test("pos_alias")
 def t_pos_alias():
     st = status()
-    p = [int(v) for v in st["pos"]]
+    p = [int(v // 1) for v in st["pos"]]   # 负坐标要向下取整
     payload = None
     for _ in range(30):
         code, payload = http("get_block", {"pos": [p[0], p[1] + 3, p[2]]})

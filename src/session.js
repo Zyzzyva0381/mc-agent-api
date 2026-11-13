@@ -840,6 +840,18 @@ async function collectDrops(s, near, radius = 4) {
 
 // 对实体右键：无 item 就是"用一下"（上船/上马/村民对话），有 item 就是把物品用在它身上
 // （喂食繁殖、驯服、剪羊毛、挤奶、拴绳、装鞍、桶装生物、给狼穿脱甲）
+// 起床。mineflayer 4.39 的 bot.wake() 写死 actionId: 2，而 1.21.6+ 的 player_command 去掉了潜行两项，
+// 2 现在是 stop_sprinting：服务端收不到起床，bot 一直躺着（只有全员入睡跳夜时才会被服务端叫醒）。
+// 这里按名字发 stop_sleeping，并等服务端真的把人放下床。
+async function leaveBed(s) {
+  const b = s.bot
+  b._client.write('entity_action', { entityId: b.entity.id, actionId: 'stop_sleeping', jumpBoost: 0 })
+  const t0 = Date.now()
+  while (b.isSleeping && Date.now() - t0 < 2000) await sleep(50)
+  if (b.isSleeping) fail('cannot_sleep', 'server did not let the bot leave the bed within 2 s')
+  return { woke: true }
+}
+
 async function interactEntity(s, entityId, item) {
   let e = s.bot.entities[entityId]
   if (!e) fail('no_such_entity', `entity ${entityId} not visible`, {
@@ -1776,7 +1788,7 @@ const api = {
     await goNear(s, p, 3)
     if (!item && block.name.endsWith('_bed')) {
       // 睡着时再点一次床就是起床
-      if (s.bot.isSleeping) { try { await s.bot.wake() } catch (e) { fail('cannot_sleep', e.message) } return { woke: true } }
+      if (s.bot.isSleeping) return await leaveBed(s)
       const night = !s.bot.time.isDay || !!s.bot.thunderState
       if (night) {
         try { await s.bot.sleep(block); return { slept: true } } catch (e) { /* 入睡失败也要把右键包发出去 */ }
@@ -1785,6 +1797,8 @@ const api = {
       // 而不是本地 sleep 校验直接 cannot_sleep 一个包都不发。
       await s.bot.activateBlock(block)
       await sleep(300)
+      // mineflayer 的"白天"判断比原版宽（原版 12542 起就能睡），服务端可能已经让 bot 躺下了
+      if (s.bot.isSleeping) return { slept: true }
       return { slept: false, interacted: true, daytime: !night }
     }
     if (item) await s.bot.equip(findItem(s, item), 'hand')

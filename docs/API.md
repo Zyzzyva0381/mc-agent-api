@@ -417,7 +417,7 @@ POST /interact  {"entity_id": 42}                        // 实体：上船 / �
 }}
 ```
 
-**床**：夜里睡着返回 `{"slept": true}`；已经睡着再点一次是起床，返回 `{"woke": true}`。
+**床**：夜里睡着返回 `{"slept": true}`；已经睡着再点一次是起床，返回 `{"woke": true}`（返回时服务端已确认下床；2 s 内没下床返回 `cannot_sleep`）。
 白天（或入睡失败）**仍会发一次原生右键包**，返回 `{"slept": false, "interacted": true, "daytime": true}`——这样白天也能把重生点绑到床上，而不是本地 `cannot_sleep` 一个包都不发。
 
 **实体**返回：
@@ -790,6 +790,7 @@ curl -s -X POST http://127.0.0.1:18900/api/v1/posture \
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 1.3.4 | 2026-11-12 | 修复：睡着时再点床**起不来**（mineflayer 的起床包在 1.21.11 协议里被当成"停止疾跑"，服务端不认；以前只在全员入睡、服务端跳夜时才会被叫醒）。现在 `woke: true` 表示服务端已确认下床，2 s 内没下床返回 `cannot_sleep`。早夜（原版 12542 起）睡觉也如实返回 `slept: true` |
 | 1.3.3 | 2026-11-12 | `POST /control` 新增 `hit`（按当前视线原版左键，可连挥 N 下）与 `hit_interval_ms`；结果新增 `pitch`、`hits`、`hit_interval_ms`、`held` |
 | 1.3.2 | 2026-11-12 | 钓鱼咬钩判定修正（只在浮标入水后判定，基准取最近 1 秒最高点），误判自动重抛，结果新增 `casts`、`false_bites`，没钓到改返回 `timeout`；`hurt` 事件新增 `source`、`source_entity`；`interrupted` 错误保留原始错误的附加字段与 `inner_code` |
 | 1.3.1 | 2026-11-03 | `POST /move_to` 支持骑乘掌舵：`status.in_vehicle` 非空时自动切载具模式（客户端权威，逐帧 `vehicle_move`），船 8 / 炽足兽 4 / 猪 5 / 马 9 格每秒，返回 `drove`、`vehicle`、`dist` |
