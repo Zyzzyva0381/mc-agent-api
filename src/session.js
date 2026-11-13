@@ -1744,7 +1744,26 @@ const api = {
     const before = invCounts(s.bot)
     for (let i = 0; i < 20 && !s.bot.entity.onGround; i++) await sleep(50)
     const t0 = Date.now()
-    await withTimeout(s.bot.dig(block, true), 30000, 'dig').catch(e => { if (!s.interruptedBy) throw e })
+    // mineflayer 4.39 的 digging 插件在"预计挖掘时间"到点后会把方块**本地**写成空气
+    // （lib/plugins/digging.js finishDigging → bot._updateBlockState），而这次本地写入会
+    // 反向触发插件自己的 onBlockUpdate，让 bot.dig() 看起来正常完成。所以 bot.blockAt()
+    // 不能作为"服务器真的挖掉了"的判据：服务器拒绝（出生点保护、区域保护插件、权限不足）
+    // 时，这里读到的 air 是本地产物，返回给 agent 就是假成功（而且没有掉落物）。
+    //
+    // 判据改成"服务器下发的**最终**状态是不是空气"：被拒绝时服务器会回一个纠正包
+    // （把原方块再发一遍，state != 0），而成功时会下发 air（state 0）。有掉落物也算确认
+    // （能掉出东西说明服务器确实执行了）。
+    const serverStates = new Map() // 坐标 -> 服务器最后一次下发的方块状态 id（0 = 空气）
+    const key = pos => pos.x + ',' + pos.y + ',' + pos.z
+    const onBlockChange = packet => {
+      if (packet && packet.location) serverStates.set(key(packet.location), packet.type)
+    }
+    s.bot._client.on('block_change', onBlockChange)
+    try {
+      await withTimeout(s.bot.dig(block, true), 30000, 'dig').catch(e => { if (!s.interruptedBy) throw e })
+    } finally {
+      try { s.bot._client.removeListener('block_change', onBlockChange) } catch (e) {}
+    }
     if (s.interruptedBy) return {}
     const digMs = Date.now() - t0
     await sleep(250)
@@ -1753,6 +1772,11 @@ const api = {
     if (collect) await collectDrops(s, p)
     const gained = {}
     for (const [k, v] of Object.entries(invCounts(s.bot))) if (v > (before[k] || 0)) gained[k] = v - (before[k] || 0)
+    if (serverStates.get(key(p)) !== 0 && !Object.keys(gained).length) {
+      // 把被本地兜底写成空气的方块还原，避免之后的观测、寻路和"这块已经挖了"的判断都被污染
+      try { s.bot._updateBlockState(p, block.stateId) } catch (e) {}
+      fail('protected_region', `server did not confirm the dig of ${block.name} at ${p} (spawn protection or plugin)`, { pos: fmt(p) })
+    }
     return { dug: block.name, dig_ms: digMs, tool: tool ? tool.name : 'hand', gained, ...(harvestable ? {} : { warning: 'no proper tool: block drops nothing' }) }
   },
   async place(s, { item, x, y, z }) {
