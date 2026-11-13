@@ -149,6 +149,8 @@ GET /status
   "result": {
     "username": "Agent_1",
     "pos": [-76.5, 102, 37.5],
+    "speed": 0,
+    "velocity": [0, -1.568, 0],
     "yaw": 1.57,
     "dimension": "overworld",
     "gamemode": "survival",
@@ -190,6 +192,8 @@ GET /status
 |---|---|
 | `ready` | **可以调用动作接口了**：就绪适配器确认已在目标服务器且存活 |
 | `busy` | 正在执行的动作名，空闲为 `null` |
+| `speed` | 当前水平速度（格/秒），由三轴速度的 X/Z 分量计算；保留 3 位小数，尚无有效速度数据时为 `null` |
+| `velocity` | 当前 bot 实体的三轴物理速度 `[vx, vy, vz]`（格/秒），按 20 tick/s 换算，保留 3 位小数；尚无有效数据时为 `null`。Y 正值向上、负值向下；站立时物理引擎仍可能保留向下的重力分量，因此水平 `speed` 可为 0 而 `vy` 不为 0。这不是按墙钟时间采样的位移速度，也不代表载具的实际行驶速度 |
 | `xp_progress` | 当前等级内的经验进度 0–1（配合 `xp_level` 判断离 30 级还差多少） |
 | `armor_points` | 当前护甲值（0–20），按护甲属性或装备换算 |
 | `effects` | 药水效果列表；`level` 从 1 起（原版 amplifier + 1） |

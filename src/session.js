@@ -4,6 +4,7 @@
 const mineflayer = require('mineflayer')
 const { pathfinder, Movements, goals } = require('mineflayer-pathfinder')
 const { Vec3 } = require('vec3')
+const { motionSummary } = require('./motion')
 
 const sleep = ms => new Promise(r => setTimeout(r, ms))
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a)
@@ -1540,6 +1541,7 @@ const api = {
     const vehicle = b.vehicle
     return {
       username: b.username, pos: fmt(p), yaw: +e.yaw.toFixed(2),
+      ...motionSummary(e),
       dimension: b.game.dimension, gamemode: b.game.gameMode,
       health: b.health, food: b.food, saturation: +b.foodSaturation.toFixed(1),
       xp_level: b.experience.level, xp_progress: +((b.experience && b.experience.progress) || 0).toFixed(3),
