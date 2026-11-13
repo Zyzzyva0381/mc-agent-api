@@ -1057,6 +1057,36 @@ def t_control_hit():
     return out
 
 
+@test("knockback")
+def t_knockback():
+    """挨打要被击退：1.21.9+ 的速度包是 lpVec3，mineflayer 4.39 多除了 8000，bot 曾经纹丝不动。
+    来源用 marker（非生物，伤害不随难度缩放），在 bot 西边，服务端位置要朝 +x 移开 > 1 格。"""
+    import re
+    clean_player()
+    goto_home()
+    x, y, z = pos_of()
+    rcon(f"gamemode survival {USER}")
+    out = {}
+    try:
+        rcon("kill @e[type=marker]")
+        rcon(f"summon marker {x - 1.5} {y} {z + 0.5} {{Tags:[kbsrc]}}")
+        time.sleep(0.6)
+
+        def spos():
+            return [float(v) for v in re.findall(r"(-?\d+(?:\.\d+)?)d", rcon(f"data get entity {USER} Pos"))]
+        p0 = spos()
+        r = rcon(f"damage {USER} 1 minecraft:mob_attack by @e[type=marker,tag=kbsrc,limit=1]")
+        check("Applied" in r, f"damage command failed: {r!r}")
+        time.sleep(1.5)
+        p1 = spos()
+        out = {"dx": round(p1[0] - p0[0], 3), "dz": round(p1[2] - p0[2], 3)}
+        check(out["dx"] > 1.0 and abs(out["dz"]) < 0.3, f"no knockback away from the attacker: {out}")
+    finally:
+        rcon("kill @e[type=marker]")
+        clean_player()
+    return out
+
+
 @test("busy")
 def t_busy():
     goto_home()

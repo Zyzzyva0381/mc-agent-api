@@ -189,6 +189,27 @@ class Session {
         try { s.bot.emit('dismount', v) } catch (e) {}
       }
     })
+    // 1.21.9+ 的 entity_velocity / spawn_entity 速度字段是 lpVec3，minecraft-protocol 已解成
+    // 格/tick，但 mineflayer 4.39 仍按旧协议再乘 1/8000 —— bot 吃到的击退被缩小 8000 倍，
+    // 看上去"免疫击退"（实测服务端位置纹丝不动），别的实体的 velocity 也全是 ~0。
+    // mineflayer 的内置插件在 inject_allowed（createBot 之后的 setTimeout 0）才注册监听器，
+    // 这里要等它之后再挂，才能排在它后面把值改回原样（直接在这里 on 会先跑、再被它覆盖）。
+    let lpVelocity = false
+    try {
+      const t = require('minecraft-data')(s.bot.version || config.minecraft.version).protocol.play.toClient.types
+      lpVelocity = JSON.stringify(t.packet_entity_velocity).includes('lpVec3')
+    } catch (e) {}
+    if (lpVelocity) {
+      const fixVelocity = p => {
+        const e = s.bot && s.bot.entities[p.entityId]
+        if (e && p.velocity) e.velocity.set(p.velocity.x, p.velocity.y, p.velocity.z)
+      }
+      const bot = s.bot
+      bot.once('inject_allowed', () => {
+        bot._client.on('entity_velocity', fixVelocity)
+        bot._client.on('spawn_entity', fixVelocity)
+      })
+    }
     s.bot._client.removeAllListeners('add_resource_pack')
     s.bot._client.on('add_resource_pack', async data => {
       s.log('RESOURCE_PACK request', s.bot._client.state, data.uuid)
@@ -797,8 +818,10 @@ function projectileAim(bot, target, physics, velocity) {
   const origin = bot.entity.position.offset(0, 1.52, 0)
   let aimed = target
   let solution = solveProjectile(origin, aimed, physics)
-  if (velocity && Math.hypot(velocity.x, velocity.y, velocity.z) > 0.005) {
-    aimed = target.plus(velocity.scaled(solution.ticks))
+  // 只按水平速度算提前量：站在地上的生物，服务端发来的速度带着 y≈-0.078 的"重力残值"，
+  // 按它外推会把瞄点压低 1 格多（1.3.5 修好速度包之前这里的速度一直是 ~0，提前量等于没生效）。
+  if (velocity && Math.hypot(velocity.x, velocity.z) > 0.005) {
+    aimed = target.offset(velocity.x * solution.ticks, 0, velocity.z * solution.ticks)
     solution = solveProjectile(origin, aimed, physics)
   }
   const dx = aimed.x - origin.x
