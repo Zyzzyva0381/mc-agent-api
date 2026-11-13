@@ -5,6 +5,7 @@
 - 接口规范：[docs/API.md](docs/API.md)
 - 对接自己的服务器（认证 / 代理网络）：[docs/ADAPTERS.md](docs/ADAPTERS.md)
 - 真机验收脚本：[test/live_test.py](test/live_test.py)
+- Minecraft Agent 挑战赛初赛规则（草案）：[docs/RULES.md](docs/RULES.md)
 
 > 目前只在 **Minecraft Java 1.21.11**（Leaves 服务端，Velocity 代理）上完整验证过：`yggdrasil` 认证 + `proxy` 就绪判定的组合跑通了全部 31 项真机验收。`offline` + `direct` 的组合还没有在真机上单独跑过完整回归，遇到问题欢迎提 issue。代码里有若干针对 1.21.x 协议的修补，其它版本可以在 `minecraft.version` 里改，但不保证可用。
 
