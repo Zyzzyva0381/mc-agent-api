@@ -305,8 +305,9 @@ class Session {
     s.bot.on('spawn', () => setTimeout(() => {
       if (!s.bot) return
       if (s.bot.vehicle) { const v = s.bot.vehicle; s.bot.vehicle = null; s.bot.emit('dismount', v); s.log('WATCHDOG cleared phantom vehicle', v.name) }
-      const p = s.bot.entity.position
-      s.bot._client.emit('position', { teleportId: -1, x: p.x, y: p.y, z: p.z, dx: 0, dy: 0, dz: 0, yaw: 0, pitch: 0, flags: { x: false, y: false, z: false, yaw: true, pitch: true, dx: false, dy: false, dz: false } })
+      // 坐标用"相对 0"：位置不变，且 mineflayer 只在绝对坐标时清速度——
+      // 以前用绝对坐标，进服第 4 秒恰好挨打 / 跳跃 / 下落时速度会被清零（击退被吞）
+      s.bot._client.emit('position', { teleportId: -1, x: 0, y: 0, z: 0, dx: 0, dy: 0, dz: 0, yaw: 0, pitch: 0, flags: { x: true, y: true, z: true, yaw: true, pitch: true, dx: false, dy: false, dz: false } })
     }, 4000))
     s.bot.once('spawn', () => {
       s.bot.physics.playerHalfWidth = 0.3001
