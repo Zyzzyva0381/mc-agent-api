@@ -833,7 +833,7 @@ def t_bridge():
         check(b["name"] == "air", f"bridge cell {tgt} not empty: {b['name']}")
         built.append(ok("place", {"item": "cobblestone", "x": tgt[0], "y": tgt[1], "z": tgt[2]}))
         check(status()["sneaking"], "sneak dropped during bridging")
-    ok("move_to", {"x": 40, "z": -3, "range": 0.7})
+    ok("move_to", {"x": OX + 40.5, "z": OZ - 2.5, "range": 0.7})
     st = status()
     check(abs(st["pos"][2] - OZ + 3) < 1.0, f"bot did not walk out on the bridge: z={st['pos'][2]}")
     check(abs(st["pos"][1] - by) < 1.2, f"bot fell off the bridge: y={st['pos'][1]}")
@@ -949,7 +949,8 @@ def t_primitives():
     out["float"] = [y1, y2]
     ok("posture", {})
     rcon(f"fill {x+2} {y-4} {z+2} {x+4} {y} {z+4} air")
-    rcon(f"fill {x+2} {y-6} {z+2} {x+4} {y-6} {z+4} air")
+    rcon(f"fill {x+2} {y-5} {z+2} {x+4} {y-5} {z+4} air")
+    rcon(f"fill {x+2} {y-1} {z+2} {x+4} {y-1} {z+4} stone")  # 水池占掉了石台地板，补回来
     goto_home()
 
     # 空手 max_hits=1：只打一下就走，间隔按原版空手 250ms（先清掉地上掉落物和背包，保证真是空手）
@@ -1117,7 +1118,12 @@ def t_status_motion():
     """/status 的 speed / velocity：站着 speed≈0、vy<0；/control 前进时 speed 接近步行 4.3、疾跑 5.6。"""
     clean_player()
     goto_home()
-    st = status()
+    # 传送后到下一个物理 tick 之前 speed 是 null（规范如此）；原地再传送一次时 settle 会立刻返回，所以等一下
+    for _ in range(20):
+        st = status()
+        if st.get("speed") is not None:
+            break
+        time.sleep(0.05)
     check(st.get("speed") is not None and st["speed"] < 0.2, f"standing speed should be ~0: {st.get('speed')}")
     check(isinstance(st.get("velocity"), list) and len(st["velocity"]) == 3, f"velocity missing: {st.get('velocity')}")
     out = {"standing": {"speed": st["speed"], "velocity": st["velocity"]}}
@@ -1142,7 +1148,7 @@ def t_busy():
     res = {}
 
     def slow():
-        res["a"] = http("move_to", {"x": 24, "z": 24, "range": 1})
+        res["a"] = http("move_to", {"x": OX + 24, "z": OZ + 24, "range": 1})  # 石台另一角，约 20 格
 
     t = threading.Thread(target=slow)
     t.start()
