@@ -782,7 +782,7 @@ POST /stop
 | `interrupted` | 动作被打断（附 `cause`：`stop` / `hurt` / …，以及 `nearest_hostile`、`inner_code`） |
 | `path_not_found` / `timeout` | 寻路失败 / 超时 |
 | `out_of_reach` / `out_of_range` | 够不到 / 没有可用弹道 |
-| `no_such_entity` | 实体不存在或已消失 |
+| `no_such_entity` | 实体不在 bot 的实体列表里（消息写作 `entity N not visible`，但**不检查视线**，墙后的目标照样会寻路过去）：已死亡（死亡动画约 1 s 后移除）/ 消失、超出服务端实体追踪范围（取决于服务器的 `entity-tracking-range`，Spigot/Paper 默认生物与玩家都是 48 格）、或 id 来自上次登录 / 重生 / 切维度之前（这些情况 id 全部作废）。请用 `get_entities` 重新取 id，不要长期缓存 |
 | `missing_item` / `missing_ammo` / `missing_ingredients` | 缺物品 / 缺弹药 / 缺材料 |
 | `need_crafting_table` / `need_furnace` / `no_recipe` | 合成相关 |
 | `no_support` / `occupied` / `place_failed` / `blocked_by_self` | 放置相关 |

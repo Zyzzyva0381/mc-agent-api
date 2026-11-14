@@ -1187,6 +1187,10 @@ def t_bucket():
     src, floor, air = [hx + 3, F, hz], [hx + 3, F, hz + 3], [hx + 3, Y, hz - 3]
     rcon(f"setblock {src[0]} {F} {src[2]} water")
     try:
+        for _ in range(20):  # 等 bot 收到方块更新，否则装水时本地看到的还是石头
+            if block_at(*src)["name"] == "water":
+                break
+            time.sleep(0.25)
         give("bucket")
         r1 = ok("interact", {"pos": src, "item": "bucket"})
         check(r1.get("changed") and counts().get("water_bucket") == 1, f"bucket did not pick up water: {r1}")
