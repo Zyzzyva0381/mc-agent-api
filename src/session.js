@@ -341,7 +341,9 @@ class Session {
     // 以前 ready 一变 true 就调 get_entities 常常拿到 []。每次（重新）进入一个后端世界都重新等：
     // 区块到齐（最多 8 s）后，再等到 600 ms 内没有新实体出现（最多再 3 s）。
     s.bot.on('entitySpawn', () => { s.lastEntitySpawnAt = Date.now() })
-    s.bot.on('login', () => { s.worldReady = false; s.worldGen++ })
+    // 死亡重生、切维度走的是 respawn 包（不是 login），之前 ready 一直是 true，
+    // 换完世界后约 0.25 s 内 get_block 会 not_loaded、get_entities 为空
+    for (const ev of ['login', 'respawn']) s.bot.on(ev, () => { s.worldReady = false; s.worldGen++ })
     s.bot.on('spawn', async () => {
       if (s.worldReady) return
       const bot = s.bot
@@ -670,6 +672,63 @@ async function goNear(s, pos, range, timeout = 60000) {
     if (e instanceof ApiError) { e.extra = { pos: fmt(s.bot.entity.position), dist_left: +s.bot.entity.position.distanceTo(pos).toFixed(1), resets }; throw e }
     fail('path_not_found', e.message, { from: fmt(s.bot.entity.position), to: fmt(pos) })
   } finally { if (s.bot) s.bot.removeListener('path_reset', onReset) }
+}
+
+// 桶：原版是"使用物品"包（use_item），服务端按玩家视线做射线判定，
+// 不是"右键方块"包——以前走 activateBlock，装水倒水都只返回 changed:false。
+//  - 空桶：pos 传液体源方块，瞄准它的液面；
+//  - 满桶（水 / 岩浆 / 细雪 / 鱼桶）：pos 传承载方块，液体出现在它朝向 bot 的那一面（通常是顶面）；
+//    pos 若是空气 / 可替换格，就当作目标格，改瞄它下面那块的顶面。
+async function useBucket (s, p, item) {
+  const b = s.bot
+  const eye = b.entity.position.offset(0, b.entity.eyeHeight || 1.62, 0)
+  const center = p.offset(0.5, 0.5, 0.5)
+  let clicked = p
+  let normal = null
+  if (item === 'bucket') {
+    const src = b.blockAt(p)
+    const props = src ? blockProps(src) : {}
+    if (!src || !(['water', 'lava', 'powder_snow', 'bubble_column'].includes(src.name) || props.waterlogged === true || props.waterlogged === 'true')) {
+      fail('cannot_interact', `an empty bucket needs pos to be the liquid block itself (got ${src ? src.name : 'nothing'})`, { block: src ? src.name : null })
+    }
+  } else {
+    const at = b.blockAt(p)
+    const below = b.blockAt(p.offset(0, -1, 0))
+    if (at && at.boundingBox === 'empty' && below && below.boundingBox === 'block') {
+      clicked = below.position
+      normal = new Vec3(0, 1, 0)
+    } else {
+      const d = eye.minus(center)
+      const ax = Math.abs(d.x); const ay = Math.abs(d.y); const az = Math.abs(d.z)
+      normal = d.y > 0.5 ? new Vec3(0, 1, 0)
+        : ax >= ay && ax >= az ? new Vec3(Math.sign(d.x), 0, 0)
+          : az >= ay ? new Vec3(0, 0, Math.sign(d.z)) : new Vec3(0, Math.sign(d.y), 0)
+    }
+  }
+  // 空桶瞄液面稍下（源方块液面高约 0.89）：瞄中心的话斜着看会先擦到旁边方块的顶面
+  const aim = normal ? clicked.offset(0.5, 0.5, 0.5).plus(normal.scaled(0.49)) : p.offset(0.5, 0.85, 0.5)
+  const target = item === 'bucket' ? p : clicked.plus(normal)
+  const before = b.blockAt(target)
+  const invBefore = invCounts(b)
+  await b.lookAt(aim, true)
+  await sleep(100)
+  b.activateItem()
+  await sleep(500)
+  try { b.deactivateItem() } catch {}
+  const after = b.blockAt(target)
+  const invAfter = invCounts(b)
+  const used = {}; const gained = {}
+  for (const k of new Set([...Object.keys(invBefore), ...Object.keys(invAfter)])) {
+    const d = (invAfter[k] || 0) - (invBefore[k] || 0)
+    if (d < 0) used[k] = -d
+    if (d > 0) gained[k] = d
+  }
+  const changed = !!(before && after && before.stateId !== after.stateId)
+  return {
+    block: b.blockAt(clicked) ? b.blockAt(clicked).name : null,
+    target: fmt(target), before: before && before.name, after: after && after.name, changed,
+    ...(Object.keys(used).length ? { used } : {}), ...(Object.keys(gained).length ? { gained } : {})
+  }
 }
 
 // 原版左键：沿视线找 3 格内（生存模式实体交互距离，从眼睛算）最近的实体判定箱，被方块挡住的不算；
@@ -1941,6 +2000,7 @@ const api = {
       return { slept: false, interacted: true, daytime: !night }
     }
     if (item) await s.bot.equip(findItem(s, item), 'hand')
+    if (item && /bucket$/.test(item) && item !== 'milk_bucket') return await useBucket(s, p, item)
     const above = p.offset(0, 1, 0)
     const upBefore = s.bot.blockAt(above)
     const invBefore = invCounts(s.bot)
@@ -2599,14 +2659,22 @@ const api = {
     return { yaw: +s.bot.entity.yaw.toFixed(3), pitch: +s.bot.entity.pitch.toFixed(3) }
   },
 
+  // 打断正在执行的动作，并等它真正退出、动作锁释放后再返回（最多 5 s），
+  // 这样紧接着发的下一个动作不会撞 busy。被停掉的动作返回 interrupted（cause: "stop"），
+  // 有部分结果的动作照常 ok:true 并带 interrupted_by: "stop"。
   async stop(s) {
     if (!s.bot) return { stopped: false }
+    const running = s.busy
+    if (running) s.interruptedBy = 'stop'
     s.bot.pathfinder.setGoal(null)
-    s.bot.stopDigging()
+    try { s.bot.stopDigging() } catch {}
     s.bot.clearControlStates()
     try { s.bot.deactivateItem() } catch {}
     s.applyPosture()
-    return { stopped: true }
+    if (!running) return { stopped: true, action: null }
+    const t0 = Date.now()
+    while (s.busy === running && Date.now() - t0 < 5000) await sleep(20)
+    return { stopped: true, action: running.name, released: s.busy !== running, wait_ms: Date.now() - t0 }
   },
   // Connection management
   async connect(s) {

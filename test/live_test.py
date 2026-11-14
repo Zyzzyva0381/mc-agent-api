@@ -1154,6 +1154,57 @@ def t_busy():
     return {"http": code, "code": p["error"]["code"]}
 
 
+@test("stop_release")
+def t_stop_release():
+    """/stop 要真的打断动作，并在返回前释放动作锁：紧接着的下一个动作不能撞 busy。"""
+    goto_home()
+    res = {}
+
+    def slow():
+        res["a"] = http("control", {"jump": True, "ms": 3000})[1]
+
+    t = threading.Thread(target=slow)
+    t.start()
+    time.sleep(0.5)
+    t0 = time.time()
+    st = ok("stop", {})
+    stop_ms = round((time.time() - t0) * 1000)
+    nxt = http("control", {"sneak": True, "ms": 50})[1]
+    t.join(timeout=10)
+    check(st.get("action") == "control" and st.get("released") is True, f"stop did not release the lock: {st}")
+    check(nxt.get("ok") is True, f"next action after stop failed: {nxt}")
+    a = res.get("a") or {}
+    check(a.get("ok") is True and a["result"].get("interrupted_by") == "stop", f"stopped control should report interrupted_by=stop: {a}")
+    return {"stop_ms": stop_ms, "stop": st, "orig_ms": a.get("ms")}
+
+
+@test("bucket")
+def t_bucket():
+    """桶走 use_item + 视线判定：空桶 pos=液体格；满桶 pos=承载方块或目标空气格。"""
+    goto_home()
+    hx, _, hz = HOME
+    F = Y - 1
+    src, floor, air = [hx + 3, F, hz], [hx + 3, F, hz + 3], [hx + 3, Y, hz - 3]
+    rcon(f"setblock {src[0]} {F} {src[2]} water")
+    try:
+        give("bucket")
+        r1 = ok("interact", {"pos": src, "item": "bucket"})
+        check(r1.get("changed") and counts().get("water_bucket") == 1, f"bucket did not pick up water: {r1}")
+        r2 = ok("interact", {"pos": floor, "item": "water_bucket"})
+        check(r2.get("changed") and block_at(floor[0], Y, floor[2])["name"] == "water", f"water was not placed on the floor block: {r2}")
+        r3 = ok("interact", {"pos": [floor[0], Y, floor[2]], "item": "bucket"})
+        check(r3.get("changed"), f"could not pick the placed water back up: {r3}")
+        r4 = ok("interact", {"pos": air, "item": "water_bucket"})
+        check(r4.get("changed") and block_at(*air)["name"] == "water", f"water was not placed into the target air cell: {r4}")
+        bad = call("interact", {"pos": [hx + 4, F, hz], "item": "bucket"})
+        check(not bad.get("ok") and bad["error"]["code"] == "cannot_interact", f"empty bucket on stone should fail: {bad}")
+        return {"fill": r1, "empty_floor": r2, "empty_air": r4}
+    finally:
+        rcon(f"fill {hx - 4} {Y} {hz - 4} {hx + 6} {Y + 2} {hz + 4} air")
+        rcon(f"fill {hx - 4} {F} {hz - 4} {hx + 6} {F} {hz + 4} stone")
+        clean_player()
+
+
 @test("events")
 def t_events():
     ev = ok("events", {"since": 0, "limit": 500})

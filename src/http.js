@@ -155,7 +155,11 @@ async function handleRequest (req, res) {
 
   // Action guards
   if (!READONLY.has(name)) {
-    if (!session.isReady() && name !== 'connect') return send(200, { ok: false, error: { code: 'wrong_server', message: 'bot is not ready on the target server' } })
+    if (!session.isReady() && name !== 'connect') {
+      // 已在比赛服、只是登录 / 重生 / 切维度后区块和实体还没到齐：给 not_ready，别误报成 wrong_server
+      if (session.bot && session.readiness.isReady() && !session.worldReady) return send(200, { ok: false, error: { code: 'not_ready', message: 'world is still loading (after login, respawn or dimension change); retry in a moment' } })
+      return send(200, { ok: false, error: { code: 'wrong_server', message: 'bot is not ready on the target server' } })
+    }
     if (!session.alive && name !== 'connect') return send(200, { ok: false, error: { code: 'dead', message: 'bot is dead, waiting for respawn' } })
     if (session.busy) return send(200, { ok: false, error: { code: 'busy', message: `running ${session.busy.name}` } })
     session.busy = { name, t: Date.now() }
