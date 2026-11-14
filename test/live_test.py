@@ -1112,6 +1112,29 @@ def t_entity_push():
         goto_home()
 
 
+@test("status_motion")
+def t_status_motion():
+    """/status 的 speed / velocity：站着 speed≈0、vy<0；/control 前进时 speed 接近步行 4.3、疾跑 5.6。"""
+    clean_player()
+    goto_home()
+    st = status()
+    check(st.get("speed") is not None and st["speed"] < 0.2, f"standing speed should be ~0: {st.get('speed')}")
+    check(isinstance(st.get("velocity"), list) and len(st["velocity"]) == 3, f"velocity missing: {st.get('velocity')}")
+    out = {"standing": {"speed": st["speed"], "velocity": st["velocity"]}}
+    for name, body, lo, hi in (("walk", {"forward": True}, 3.6, 5.0), ("sprint", {"forward": True, "sprint": True}, 4.8, 6.5)):
+        goto_home()
+        res = {}
+        th = threading.Thread(target=lambda: res.setdefault("r", http("control", {**body, "yaw": 0, "ms": 1500})))
+        th.start()
+        time.sleep(0.7)  # 0.5 s 内就加速到稳定速度；石台只有 7 格，别跑出边
+        samples = [status()["speed"] for _ in range(4)]
+        th.join(10)
+        out[name] = samples
+        check(all(s is not None and lo <= s <= hi for s in samples), f"{name} speed out of range [{lo},{hi}]: {samples}")
+    goto_home()
+    return out
+
+
 @test("busy")
 def t_busy():
     goto_home()

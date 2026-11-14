@@ -4,7 +4,7 @@
 const mineflayer = require('mineflayer')
 const { pathfinder, Movements, goals } = require('mineflayer-pathfinder')
 const { Vec3 } = require('vec3')
-const { motionSummary } = require('./motion')
+const { createMotionTracker } = require('./motion')
 
 const sleep = ms => new Promise(r => setTimeout(r, ms))
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a)
@@ -362,6 +362,10 @@ class Session {
       'block_display', 'item_display', 'text_display', 'interaction', 'falling_block', 'tnt', 'fishing_bobber'])
     const LIVING_TYPES = new Set(['player', 'mob', 'hostile', 'passive', 'animal', 'ambient', 'water_creature', 'living'])
     const pushable = e => !NOT_PUSHABLE.has(e.name) && (LIVING_TYPES.has(e.type) || /boat|raft|minecart/.test(e.name || ''))
+    s.motion = createMotionTracker()
+    // physicsTick 只在物理开着时触发：传送、骑乘上下车之后从头算，免得把一段跳变当成速度
+    for (const ev of ['forcedMove', 'mount', 'dismount', 'respawn']) s.bot.on(ev, () => s.motion && s.motion.reset())
+    s.bot.on('physicsTick', () => { if (s.bot && s.bot.entity && s.motion) s.motion.tick(s.bot.entity.position) })
     s.bot.on('physicsTick', () => {
       const bot = s.bot
       const me = bot && bot.entity
@@ -1629,7 +1633,8 @@ const api = {
     const vehicle = b.vehicle
     return {
       username: b.username, pos: fmt(p), yaw: +e.yaw.toFixed(2),
-      ...motionSummary(e),
+      // 按每个物理 tick 的实际位移算；骑乘时位置是 driveVehicle 自己逐帧写的，给 null
+      ...(b.vehicle || !s.motion ? { speed: null, velocity: null } : s.motion.summary()),
       dimension: b.game.dimension, gamemode: b.game.gameMode,
       health: b.health, food: b.food, saturation: +(b.foodSaturation || 0).toFixed(1),
       xp_level: b.experience.level, xp_progress: +((b.experience && b.experience.progress) || 0).toFixed(3),
