@@ -214,6 +214,34 @@ class Session {
         bot._client.on('spawn_entity', fixVelocity)
       })
     }
+    // 1.21 的物品组件里，prismarine-item 的 item.enchants 返回 {enchantments:[{id,level}]} 对象而不是
+    // [{name,lvl}] 数组；mineflayer 的 digTime 把它交给 prismarine-block 用 for...of 遍历，
+    // 手持附魔工具挖任何方块都抛 "enchantments is not iterable"（头盔附魔则被静默忽略）。
+    // 照 mineflayer 原实现重写 bot.digTime，附魔改从组件里读并换成它要的格式。
+    {
+      const bot = s.bot
+      const enchList = item => {
+        if (!item) return []
+        const ex = itemExtras(item).enchantments
+        if (ex) return ex.map(e => ({ name: e.name, lvl: e.level }))
+        const raw = item.enchants
+        return Array.isArray(raw) ? raw : []
+      }
+      bot.once('inject_allowed', () => {
+        bot.digTime = block => {
+          const held = bot.heldItem
+          const head = bot.inventory.slots[bot.getEquipmentDestSlot('head')]
+          return block.digTime(
+            held ? held.type : null,
+            bot.game.gameMode === 'creative',
+            ['water', 'flowing_water'].includes(bot._getBlockAtEyeLevel()?.name),
+            !bot.entity.onGround,
+            [...enchList(held), ...enchList(head)],
+            bot.entity.effects
+          )
+        }
+      })
+    }
     s.bot._client.removeAllListeners('add_resource_pack')
     s.bot._client.on('add_resource_pack', async data => {
       s.log('RESOURCE_PACK request', s.bot._client.state, data.uuid)

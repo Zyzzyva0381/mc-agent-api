@@ -1215,6 +1215,37 @@ def t_bucket():
         clean_player()
 
 
+@test("dig_enchanted")
+def t_dig_enchanted():
+    """手持附魔工具挖掘：1.21 下 item.enchants 是对象，mineflayer digTime 曾抛 "enchantments is not iterable"。
+    效率 V 铁镐挖石头要成功，且比普通铁镐快。"""
+    goto_home()
+    hx, _, hz = HOME
+    out = {}
+    try:
+        for name, spec in (("plain", "iron_pickaxe"), ("efficiency5", "iron_pickaxe[enchantments={efficiency:5}]")):
+            clean_player()
+            rcon(f"setblock {hx + 2} {Y} {hz} stone")
+            for _ in range(20):  # 等 bot 收到方块更新
+                if block_at(hx + 2, Y, hz)["name"] == "stone":
+                    break
+                time.sleep(0.25)
+            check(block_at(hx + 2, Y, hz)["name"] == "stone", "stone was not placed")
+            rcon(f"give {USER} {spec}")
+            for _ in range(20):
+                if counts().get("iron_pickaxe"):
+                    break
+                time.sleep(0.15)
+            r = ok("dig", {"pos": [hx + 2, Y, hz]})
+            out[name] = r.get("dig_ms")
+        check(out["efficiency5"] is not None and out["plain"] is not None and out["efficiency5"] < out["plain"],
+              f"efficiency should dig faster: {out}")
+        return out
+    finally:
+        rcon(f"setblock {hx + 2} {Y} {hz} air")
+        clean_player()
+
+
 @test("events")
 def t_events():
     ev = ok("events", {"since": 0, "limit": 500})
