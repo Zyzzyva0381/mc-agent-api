@@ -590,7 +590,7 @@ POST /window/act   {"target": {"pos": [x, y, z]}, "ops": [{"op": "take", "from":
 | op | 参数 | 作用 |
 |---|---|---|
 | `put` | `item`, `count?`, `to`, `slot?`, `potion?`, `enchanted?`, `custom_name?` | 从背包放进区域 `to`；`count` 省略则放全部。`slot` 指定区域内第几格（工作台按行 0–8）；`potion` 按药水种类挑；`enchanted` / `custom_name` 在同名多件时指定用哪件，不指定时优先放无附魔、未改名、耐久最好的那件 |
-| `take` | `from`, `item?`, `count?` | 从区域取回背包；对成品区（`output`）取就是领取成品，铁砧会扣经验 |
+| `take` | `from`, `item?`, `count?` | 从区域取回背包；对成品区（`output`）取就是领取成品，铁砧会扣经验。只取背包放得下的量：放下了一部分时成功并带 `inventory_full: true`，一个都放不下时报 `inventory_full`，东西留在原处（成品区只能整组取，放不下整组就不取） |
 | `select` | `option`, `times?` | 选 `options` 里的第几项（从 0 开始）；村民交易可用 `times` 连续做多次，次数用完或付不起时提前结束 |
 | `text` | `value` | 文本输入（铁砧改名，最长 50 字符） |
 
@@ -793,7 +793,7 @@ POST /stop
 | `out_of_reach` / `out_of_range` | 够不到 / 没有可用弹道 |
 | `no_such_entity` | 实体不在 bot 的实体列表里（消息写作 `entity N not visible`，但**不检查视线**，墙后的目标照样会寻路过去）：已死亡（死亡动画约 1 s 后移除）/ 消失、超出服务端实体追踪范围（取决于服务器的 `entity-tracking-range`，Spigot/Paper 默认生物与玩家都是 48 格）、或 id 来自上次登录 / 重生 / 切维度之前（这些情况 id 全部作废）。请用 `get_entities` 重新取 id，不要长期缓存 |
 | `missing_item` / `missing_ammo` / `missing_ingredients` | 缺物品 / 缺弹药 / 缺材料 |
-| `inventory_full` | `craft` 的产物放不进背包（没有空格，也没有能叠加的同种堆） |
+| `inventory_full` | `craft` 的产物 / `window/act` `take` 的物品放不进背包（没有空格，也没有能叠加的同种堆）；物品不会被扔到地上 |
 | `need_crafting_table` / `need_furnace` / `no_recipe` | 合成相关 |
 | `no_support` / `occupied` / `place_failed` / `blocked_by_self` | 放置相关 |
 | `protected_region` | 服务端把改动回滚了 |
@@ -933,6 +933,7 @@ curl -s -X POST http://127.0.0.1:18900/api/v1/posture \
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 1.3.11 | 2026-11-15 | 修复背包满时物品被扔到地上：① `/window/act` `take` 从箱子 / 熔炉成品槽等取东西，以前把东西扔到地上并报 `missing_item` / `no_output` "nothing to take"（取 2 个也会把整组 5 个扔掉），现在只取放得下的量（部分成功带 `inventory_full: true`），一个都放不下时报 `inventory_full`、东西留在原处；② `/dig` 没有合适工具时会先把手上的东西收进背包，背包满时会把手上整组扔掉（实测 64 钻石），现在直接拿着它挖 |
 | 1.3.10 | 2026-11-14 | 修复：① `/dig` 挖**斜下方**的方块（例如脚下往外 1 格、往下 3 格、往前 3 格）原地 1 ms 返回 `out_of_reach`——"已经够得着"的判断按脚到方块角算，实际挖掘按眼睛到方块中心算，两者不一致；现在会先走过去；② `/interact` 用**玻璃瓶**对着水装水、放**睡莲 / 蛙卵**完全无效（`changed: false`）——现在和桶一样按视线判定，`/place` 也能放睡莲；③ 1.3.8 起**桶对炼药锅**会把水倒在炼药锅上面、空桶舀不出炼药锅里的水——炼药锅恢复为普通右键方块；④ 动作执行中途被 `/disconnect` 或断线时返回 `internal "Cannot read properties of null"`，现在返回 `not_connected`；⑤ `/craft` 打不开工作台时要等 20 s 才返回 `internal "Event windowOpen did not fire"`，现在 5 s 返回 `no_window` 并附坐标与距离；⑥ 背包满时 `/craft` 空转约 30 s 后报 `missing_ingredients "could not craft X: null"`（产物取不出来却当作成功，重试 64 轮），现在约 1 s 返回 `inventory_full` |
 | 1.3.9 | 2026-11-14 | 修复：手持**附魔工具**时 `/dig`（以及会顺路挖方块的寻路）返回 `internal`：`enchantments is not iterable`。1.21 物品组件下 prismarine-item 的 `item.enchants` 是对象而不是数组，mineflayer 算挖掘时间时遍历它就崩；附魔头盔则被静默忽略。现在附魔从物品组件读取，效率附魔也正确计入挖掘时间（效率 V 铁镐挖石头约 0.13 s，普通铁镐约 0.45 s） |
 | 1.3.8 | 2026-11-14 | 修复：① `/stop` 不等动作退出就返回，`/control` 会继续按满 `ms`，紧接着的下一个动作撞 `busy`——现在 `/stop` 返回时锁已释放，返回值新增 `action`、`released`、`wait_ms`，被停掉的动作 `cause: "stop"`；② 死亡重生、切换维度后 `ready` 不变 `false`，约 0.25 s 内 `get_block` 返回 `not_loaded`、`get_entities` 为空——现在重新等世界到齐，期间动作接口返回 `not_ready`；③ `/interact` 用桶装水 / 倒水完全无效（返回 `changed: false`）——现在按原版视线判定，坐标约定见 4.4。文档：4.9 补全界面表；4.5 写明满饱食度时哪些物品仍可使用 |

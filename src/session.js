@@ -1514,6 +1514,12 @@ function describeWindow(s, w) {
   return out
 }
 
+function diffGain(before, after) {
+  const gained = {}
+  for (const [k, v] of Object.entries(after)) if (v > (before[k] || 0)) gained[k] = v - (before[k] || 0)
+  return gained
+}
+
 // 当前界面里玩家背包部分的物品数量
 function windowInvCounts(w) {
   const c = {}
@@ -1607,6 +1613,19 @@ async function opPut(s, w, kind, { item, count, to, slot, potion, enchanted, cus
   return { put: item, count: moved, to }
 }
 
+// 背包（当前界面里的背包格）还能放下多少个和 x 一模一样的物品。同类但组件不同的堆不算（不会合并），宁少勿多。
+// mineflayer 的 putAway / transfer / putSelectedItemRange 在背包放不下时会把光标上的物品直接扔到地上。
+function roomFor(w, x) {
+  const sig = i => JSON.stringify([i.nbt ?? null, i.components ?? null])
+  let n = 0
+  for (let i = w.inventoryStart; i < w.inventoryEnd; i++) {
+    const y = w.slots[i]
+    if (!y) n += x.stackSize
+    else if (y.type === x.type && y.count < y.stackSize && sig(y) === sig(x)) n += y.stackSize - y.count
+  }
+  return n
+}
+
 async function opTake(s, w, kind, { from, item, count }) {
   const secs = kind.sections(w)
   if (!secs[from]) fail('bad_section', `section "${from}" not in ${shortType(w.type)}; have: ${Object.keys(secs).join(', ')}`)
@@ -1614,12 +1633,19 @@ async function opTake(s, w, kind, { from, item, count }) {
   const xp0 = s.bot.experience.level
   const before = windowInvCounts(w)
   let left = count ?? Infinity
+  let full = false
   // 成品由服务器计算后下发（锻造台、砂轮等），刚放完材料时可能还没到，稍等
   if (isOutput) for (let k = 0; k < 15 && !secs[from].some(i => w.slots[i]); k++) await sleep(100)
   for (const i of secs[from]) {
     if (left <= 0) break
     const cur = w.slots[i]
     if (!cur || (item && cur.name !== item)) continue
+    const room = roomFor(w, cur)
+    if (isOutput ? room < cur.count : room <= 0) {
+      // 取到一部分就算成功（标 inventory_full）；一个都没取到才报错
+      if (Object.keys(diffGain(before, windowInvCounts(w))).length) { full = true; break }
+      fail('inventory_full', `no room in the inventory for ${cur.count} ${cur.name}; free a slot first (nothing was moved)`, { room, empty_slots: range(w.inventoryStart, w.inventoryEnd).filter(k => !w.slots[k]).length })
+    }
     if (isOutput) {
       // 成品槽只能整组取：点一下拿到光标上，再放回背包
       await s.bot.clickWindow(i, 0, 0)
@@ -1628,19 +1654,18 @@ async function opTake(s, w, kind, { from, item, count }) {
       await s.bot.putSelectedItemRange(w.inventoryStart, w.inventoryEnd, w, null)
       left -= cur.count
     } else {
-      const n = Math.min(cur.count, left)
+      const n = Math.min(cur.count, left, room)
+      if (n < Math.min(cur.count, left)) full = true
       if (n >= cur.count) await s.bot.putAway(i)
       else await s.bot.transfer({ window: w, itemType: cur.type, metadata: null, sourceStart: i, sourceEnd: i + 1, destStart: w.inventoryStart, destEnd: w.inventoryEnd, count: n })
       left -= n
     }
     await sleep(150)
   }
-  const after = windowInvCounts(w)
-  const gained = {}
-  for (const [k, v] of Object.entries(after)) if (v > (before[k] || 0)) gained[k] = v - (before[k] || 0)
+  const gained = diffGain(before, windowInvCounts(w))
   if (!Object.keys(gained).length) fail(isOutput ? 'no_output' : 'missing_item', `nothing${item ? ' matching ' + item : ''} to take from ${from}`)
   const dxp = s.bot.experience.level - xp0
-  return { took: gained, from, ...(dxp < 0 ? { xp_spent: -dxp } : dxp > 0 ? { xp_gained: dxp } : {}) }
+  return { took: gained, from, ...(full ? { inventory_full: true } : {}), ...(dxp < 0 ? { xp_spent: -dxp } : dxp > 0 ? { xp_gained: dxp } : {}) }
 }
 
 async function opSelect(s, w, kind, { option, times = 1 }) {
@@ -1986,7 +2011,8 @@ const api = {
     const best = s.bot.pathfinder.bestHarvestTool(block)
     const tool = best && /_(pickaxe|axe|shovel|hoe|sword)$|^shears$/.test(best.name) ? best : null
     if (tool) await s.bot.equip(tool, 'hand')
-    else if (s.bot.heldItem) await s.bot.unequip('hand')
+    // 空手挖：背包没有空格时 mineflayer 的 unequip('hand') 会把手上整组扔到地上（实测 64 钻石），这时就拿着它挖
+    else if (s.bot.heldItem && s.bot.inventory.emptySlotCount() > 0) await s.bot.unequip('hand')
     if (!s.bot.canDigBlock(block)) fail('out_of_reach', `cannot reach ${block.name} at ${p}`, { pos: fmt(s.bot.entity.position) })
     const harvestable = !block.harvestTools || Object.keys(block.harvestTools).some(id => s.bot.inventory.items().some(i => i.type === +id))
     const before = invCounts(s.bot)

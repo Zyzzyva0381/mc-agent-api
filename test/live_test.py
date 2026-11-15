@@ -1347,6 +1347,46 @@ def t_craft():
         clean_player()
 
 
+@test("full_inventory")
+def t_full_inventory():
+    """背包满：以前 window/act take 会把箱子 / 熔炉里的东西扔到地上并报"nothing to take"；
+    空手挖（没有合适工具）时 unequip 会把手上整组扔掉。现在 take 返回 inventory_full 且东西留在原处，dig 拿着原物品挖。"""
+    goto_home()
+    hx, _, hz = HOME
+    chest = [hx + 2, Y, hz]
+    try:
+        clean_player()
+        rcon("kill @e[type=item]")
+        rcon(f"setblock {hx + 2} {Y} {hz} chest")
+        rcon(f"item replace block {hx + 2} {Y} {hz} container.0 with diamond 5")
+        give("emerald 64")
+        for _ in range(35):
+            give("stone 64")
+        time.sleep(0.8)
+        e = call("window/act", {"pos": chest, "ops": [{"op": "take", "from": "container", "item": "diamond"}]}).get("error") or {}
+        check(e.get("code") == "inventory_full", f"take with full inventory: {e}")
+        left = (e.get("window") or {}).get("sections", {}).get("container", [])
+        check(left == [{"name": "diamond", "count": 5}], f"diamonds should stay in the chest: {left}")
+        ok("equip", {"item": "emerald"})
+        rcon(f"setblock {hx - 2} {Y} {hz} dirt")
+        time.sleep(0.5)
+        ok("dig", {"pos": [hx - 2, Y, hz]})
+        time.sleep(1.5)
+        ground = [x.get("item") for x in ok("get_entities", {"radius": 8, "types": ["item"]}).get("entities", [])]
+        check(not any("emerald" in str(g) or "diamond" in str(g) for g in ground), f"items thrown on the ground: {ground}")
+        check(counts().get("emerald") == 64, f"emeralds lost: {counts().get('emerald')}")
+        rcon(f"clear {USER} stone")
+        time.sleep(0.5)
+        r = ok("window/act", {"pos": chest, "ops": [{"op": "take", "from": "container", "item": "diamond"}]})
+        check(r["done"][0].get("took") == {"diamond": 5}, f"take after freeing room: {r}")
+        return {"full_error": e.get("code"), "ground": ground}
+    finally:
+        rcon(f"setblock {hx + 2} {Y} {hz} air")
+        rcon(f"setblock {hx - 2} {Y} {hz} air")
+        rcon("kill @e[type=item]")
+        clean_player()
+
+
 @test("events")
 def t_events():
     ev = ok("events", {"since": 0, "limit": 500})
