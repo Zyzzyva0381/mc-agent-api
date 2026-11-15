@@ -387,6 +387,8 @@ POST /dig  {"pos": [100, 64, -200], "collect": true}
 
 `gained` 是"物品名 → 数量"的对象。没有合适工具时会附 `warning`。
 
+目标不在眼睛 5 格内时会先走过去（包括斜下方、要下到槽里才够得着的方块）；走到了还够不着返回 `out_of_reach`（附 `pos`）。
+
 只有收到**服务端**发来的这一格方块变化才算挖掉（`dig_ms` 含等待确认的时间）。服务端没确认时返回 `dig_unconfirmed`（方块还在，本地缓存也会恢复成原方块），附 `pos`、`eye_dist`（眼睛到方块中心的距离）、`on_ground`、`ping_ms` 方便排查——最常见的原因是服务端认为 bot 离得太远（两边位置不同步）；服务端明确把方块改回原样时返回 `protected_region`。
 
 ### 4.3 放置方块
@@ -402,6 +404,8 @@ POST /place  {"item": "cobblestone", "pos": [100, 65, -200]}
 ```
 
 若参照方块弹出了界面（说明这个位置应该走窗口接口），会自动关窗并返回 `use_window_api`。
+
+**睡莲、蛙卵**只能放在水面上：`pos` 传水面上方那格（下面必须是水源），按原版视线判定对着水使用，返回 `sneaked: false`；下面不是水源返回 `no_support`。
 
 ### 4.4 交互（方块或实体）
 
@@ -426,16 +430,21 @@ POST /interact  {"entity_id": 42}                        // 实体：上船 / �
 **床**：夜里睡着返回 `{"slept": true}`；已经睡着再点一次是起床，返回 `{"woke": true}`（返回时服务端已确认下床；2 s 内没下床返回 `cannot_sleep`）。
 白天（或入睡失败）**仍会发一次原生右键包**，返回 `{"slept": false, "interacted": true, "daytime": true}`——这样白天也能把重生点绑到床上，而不是本地 `cannot_sleep` 一个包都不发。
 
-**桶**（`bucket`、`water_bucket`、`lava_bucket`）按原版视线判定：bot 先瞄准再使用。
+**桶**（`bucket`、`water_bucket`、`lava_bucket`）、**玻璃瓶**、**睡莲**、**蛙卵**对着液体用时按原版视线判定：bot 先瞄准再使用。
 
 | 操作 | `pos` 传什么 |
 |---|---|
 | 空桶装水 / 装岩浆 | **液体源方块本身**；传旁边的固体方块返回 `cannot_interact` |
 | 倒出 | **承载方块**：液体出现在它朝向 bot 的那一面（bot 站得比它高时就是顶面）。也可以直接传**目标空气格**，此时倒在它下面那块的顶面上 |
+| 玻璃瓶装水 | **水源方块本身**（也可以传水面上方那格）；水不变，`gained: {"potion": 1}`，背包里这瓶的 `potion` 为 `"water"` |
+| 放睡莲 / 蛙卵 | **水源方块本身**（也可以传水面上方那格）；出现在水面上方，`target` 即该格。也可以用 `/place` |
+| 炼药锅 | 桶倒进 / 舀出、玻璃瓶取水都是普通右键方块：`pos` 传**炼药锅本身**，返回普通的方块变化（`before` / `after`） |
 
 ```
 POST /interact  {"pos": [100, 63, -200], "item": "bucket"}         // 装起 (100,63,-200) 的水
 POST /interact  {"pos": [104, 63, -200], "item": "water_bucket"}   // 倒在 (104,63,-200) 上面，水出现在 (104,64,-200)
+POST /interact  {"pos": [100, 63, -200], "item": "glass_bottle"}   // 从 (100,63,-200) 的水装一瓶水
+POST /interact  {"pos": [102, 64, -200], "item": "water_bucket"}   // (102,64,-200) 是炼药锅：倒满它
 ```
 
 返回 `{"block", "target", "before", "after", "changed", "used", "gained"}`：`target` 是液体实际消失 / 出现的那格。
@@ -490,7 +499,7 @@ POST /use_item  {"item": "oak_boat", "target": {"pos": [14, 64, 10]}}
 
 钓鱼在 `timeout` 内一条都没钓到时返回 `timeout`（附 `casts`、`false_bites`、`bobber_y`、`base_y`、`in_water`）；第一竿连浮标都没出现返回 `cannot_use`。被 `stop_on` 打断后不会再抛下一竿。
 
-**限制**：打火石、水桶、种子、骨粉、锄头必须对着方块用，会返回 `need_block_target`，请改调 `/interact` 并带上 `item`。其它没有空放行为的物品返回 `cannot_use`。
+**限制**：打火石、桶、种子、骨粉、锄头、玻璃瓶、睡莲、蛙卵必须对着方块用，会返回 `need_block_target`，请改调 `/interact` 并带上 `item`。其它没有空放行为的物品返回 `cannot_use`。
 
 ### 4.6 攻击
 
@@ -546,7 +555,7 @@ POST /craft  {"item": "crafting_table", "count": 1}
 {"ok": true, "result": {"crafted": "crafting_table", "gained": 1, "used_table": false, "inventory": {"oak_planks": 0}}}
 ```
 
-失败：`missing_ingredients`（附 `example_recipe_needs`、`inventory`）、`need_crafting_table`、`no_recipe`。
+失败：`missing_ingredients`（附 `example_recipe_needs`、`inventory`）、`need_crafting_table`、`no_recipe`；工作台 5 秒内没打开返回 `no_window`（附 `table` 坐标、`pos`、`eye_dist`）；背包满、产物放不进去返回 `inventory_full`（附已做出的 `gained`、`empty_slots`、`inventory`；材料留在背包里，腾出一格再调即可）。
 
 ### 4.9 界面（窗口）
 
@@ -773,7 +782,7 @@ POST /stop
 |---|---|
 | `invalid_credentials` / `no_profile` / `rate_limited` | 认证相关（`rate_limited` 也用于 `/chat` 限频） |
 | `unauthorized` / `invalid_token` | Token 缺失或失效 |
-| `not_connected` | Bot 未连接 |
+| `not_connected` | Bot 未连接；动作执行中途被 `/disconnect`、踢出或断线也返回它 |
 | `wrong_server` | 还没就绪（不在目标服务器上） |
 | `not_ready` | 数据（如进度）还没下发；或登录 / 重生 / 切维度后世界还在加载（稍等重试） |
 | `death_loop_cooldown` | 死亡循环保护中 |
@@ -784,12 +793,14 @@ POST /stop
 | `out_of_reach` / `out_of_range` | 够不到 / 没有可用弹道 |
 | `no_such_entity` | 实体不在 bot 的实体列表里（消息写作 `entity N not visible`，但**不检查视线**，墙后的目标照样会寻路过去）：已死亡（死亡动画约 1 s 后移除）/ 消失、超出服务端实体追踪范围（取决于服务器的 `entity-tracking-range`，Spigot/Paper 默认生物与玩家都是 48 格）、或 id 来自上次登录 / 重生 / 切维度之前（这些情况 id 全部作废）。请用 `get_entities` 重新取 id，不要长期缓存 |
 | `missing_item` / `missing_ammo` / `missing_ingredients` | 缺物品 / 缺弹药 / 缺材料 |
+| `inventory_full` | `craft` 的产物放不进背包（没有空格，也没有能叠加的同种堆） |
 | `need_crafting_table` / `need_furnace` / `no_recipe` | 合成相关 |
 | `no_support` / `occupied` / `place_failed` / `blocked_by_self` | 放置相关 |
 | `protected_region` | 服务端把改动回滚了 |
 | `nothing_to_dig` / `undiggable` | 挖掘相关 |
 | `dig_unconfirmed` | 挖完了但服务端没确认破坏，方块还在（见 4.2） |
 | `use_window_api` | 该目标有界面，应用 `window/*` |
+| `no_window` | 目标没有打开界面（`window/*`；`craft` 打不开工作台） |
 | `cannot_interact` / `cannot_use` / `need_block_target` | 交互或使用物品失败 |
 | `not_hungry` | 饱食度已满 |
 | `not_in_vehicle` / `dismount_failed` | 载具相关 |
@@ -922,6 +933,7 @@ curl -s -X POST http://127.0.0.1:18900/api/v1/posture \
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 1.3.10 | 2026-11-14 | 修复：① `/dig` 挖**斜下方**的方块（例如脚下往外 1 格、往下 3 格、往前 3 格）原地 1 ms 返回 `out_of_reach`——"已经够得着"的判断按脚到方块角算，实际挖掘按眼睛到方块中心算，两者不一致；现在会先走过去；② `/interact` 用**玻璃瓶**对着水装水、放**睡莲 / 蛙卵**完全无效（`changed: false`）——现在和桶一样按视线判定，`/place` 也能放睡莲；③ 1.3.8 起**桶对炼药锅**会把水倒在炼药锅上面、空桶舀不出炼药锅里的水——炼药锅恢复为普通右键方块；④ 动作执行中途被 `/disconnect` 或断线时返回 `internal "Cannot read properties of null"`，现在返回 `not_connected`；⑤ `/craft` 打不开工作台时要等 20 s 才返回 `internal "Event windowOpen did not fire"`，现在 5 s 返回 `no_window` 并附坐标与距离；⑥ 背包满时 `/craft` 空转约 30 s 后报 `missing_ingredients "could not craft X: null"`（产物取不出来却当作成功，重试 64 轮），现在约 1 s 返回 `inventory_full` |
 | 1.3.9 | 2026-11-14 | 修复：手持**附魔工具**时 `/dig`（以及会顺路挖方块的寻路）返回 `internal`：`enchantments is not iterable`。1.21 物品组件下 prismarine-item 的 `item.enchants` 是对象而不是数组，mineflayer 算挖掘时间时遍历它就崩；附魔头盔则被静默忽略。现在附魔从物品组件读取，效率附魔也正确计入挖掘时间（效率 V 铁镐挖石头约 0.13 s，普通铁镐约 0.45 s） |
 | 1.3.8 | 2026-11-14 | 修复：① `/stop` 不等动作退出就返回，`/control` 会继续按满 `ms`，紧接着的下一个动作撞 `busy`——现在 `/stop` 返回时锁已释放，返回值新增 `action`、`released`、`wait_ms`，被停掉的动作 `cause: "stop"`；② 死亡重生、切换维度后 `ready` 不变 `false`，约 0.25 s 内 `get_block` 返回 `not_loaded`、`get_entities` 为空——现在重新等世界到齐，期间动作接口返回 `not_ready`；③ `/interact` 用桶装水 / 倒水完全无效（返回 `changed: false`）——现在按原版视线判定，坐标约定见 4.4。文档：4.9 补全界面表；4.5 写明满饱食度时哪些物品仍可使用 |
 | 1.3.7 | 2026-11-13 | `/status` 新增 `speed`（水平速度，格/秒）与 `velocity`（三轴速度，格/秒），骑乘时为 `null`（社区贡献 PR #1） |

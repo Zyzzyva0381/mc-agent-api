@@ -687,8 +687,14 @@ async function gotoWatched(s, goal, timeout, stallMs = 8000) {
   }
 }
 
-async function goNear(s, pos, range, timeout = 60000) {
-  if (s.bot.entity.position.distanceTo(pos) <= range + 0.5) return
+// 眼睛到方块中心的距离（mineflayer canDigBlock 的口径，上限 5.1；服务端交互距离也按眼睛算）
+const eyeToBlock = (s, p) => s.bot.entity.position.offset(0, s.bot.entity.eyeHeight || 1.62, 0).distanceTo(p.offset(0.5, 0.5, 0.5))
+
+// reach：要对方块动手（挖 / 放）时传。"脚到方块角 ≤ range+0.5"就不动的提前返回，
+// 对斜下方的方块会出现"没走过去、眼睛却够不着"（线上 dig 原地 1 ms 报 out_of_reach），
+// 所以提前返回还要求眼睛距离在 reach 以内。寻路的 GoalNear 本身到达时眼睛距离 ≤ range+1.35，不受影响。
+async function goNear(s, pos, range, timeout = 60000, reach = null) {
+  if (s.bot.entity.position.distanceTo(pos) <= range + 0.5 && (reach === null || eyeToBlock(s, pos) <= reach)) return
   let resets = 0
   const onReset = r => { if (r === 'place_error' || r === 'dig_error') resets++ }
   s.bot.on('path_reset', onReset)
@@ -707,13 +713,36 @@ async function goNear(s, pos, range, timeout = 60000) {
 //  - 空桶：pos 传液体源方块，瞄准它的液面；
 //  - 满桶（水 / 岩浆 / 细雪 / 鱼桶）：pos 传承载方块，液体出现在它朝向 bot 的那一面（通常是顶面）；
 //    pos 若是空气 / 可替换格，就当作目标格，改瞄它下面那块的顶面。
+// 玻璃瓶装水、放睡莲 / 蛙卵也是同一套：use_item + 服务端视线判定（只认水源），activateBlock 对水无效。
+//  - pos 传水方块本身；传了水面上方那格也认（改用它下面的水）
+//  - 玻璃瓶：水不变，背包多一瓶水；睡莲 / 蛙卵：出现在水面上方那格
+const WATER_AIM_ITEMS = new Set(['glass_bottle', 'lily_pad', 'frogspawn'])
+const isWaterSource = blk => {
+  if (!blk) return false
+  if (blk.name === 'bubble_column') return true
+  const props = blockProps(blk)
+  if (blk.name === 'water') return String(props.level ?? 0) === '0'
+  return props.waterlogged === true || props.waterlogged === 'true'
+}
+// 对着水用（返回实际要瞄的水方块；不是水就返回 null，交给普通右键方块）
+function waterAimTarget (s, p, item) {
+  if (!WATER_AIM_ITEMS.has(item)) return null
+  const at = s.bot.blockAt(p)
+  if (isWaterSource(at)) return p
+  const under = s.bot.blockAt(p.offset(0, -1, 0))
+  if (at && at.boundingBox === 'empty' && isWaterSource(under)) return under.position
+  return null
+}
+
 async function useBucket (s, p, item) {
   const b = s.bot
   const eye = b.entity.position.offset(0, b.entity.eyeHeight || 1.62, 0)
   const center = p.offset(0.5, 0.5, 0.5)
   let clicked = p
   let normal = null
-  if (item === 'bucket') {
+  if (WATER_AIM_ITEMS.has(item)) {
+    if (!isWaterSource(b.blockAt(p))) fail('cannot_interact', `${item} needs pos to be a water source block`)
+  } else if (item === 'bucket') {
     const src = b.blockAt(p)
     const props = src ? blockProps(src) : {}
     if (!src || !(['water', 'lava', 'powder_snow', 'bubble_column'].includes(src.name) || props.waterlogged === true || props.waterlogged === 'true')) {
@@ -735,7 +764,7 @@ async function useBucket (s, p, item) {
   }
   // 空桶瞄液面稍下（源方块液面高约 0.89）：瞄中心的话斜着看会先擦到旁边方块的顶面
   const aim = normal ? clicked.offset(0.5, 0.5, 0.5).plus(normal.scaled(0.49)) : p.offset(0.5, 0.85, 0.5)
-  const target = item === 'bucket' ? p : clicked.plus(normal)
+  const target = item === 'bucket' || item === 'glass_bottle' ? p : normal ? clicked.plus(normal) : p.offset(0, 1, 0)
   const before = b.blockAt(target)
   const invBefore = invCounts(b)
   await b.lookAt(aim, true)
@@ -1145,6 +1174,23 @@ async function placeEntityFromItem(s, item, it, point) {
     }
   }
   fail('cannot_use', `could not find a spot to put down ${item}`, { attempts: errors.slice(0, 6), pos: fmt(b.entity.position) })
+}
+
+// 打开工作台：mineflayer 的 openBlock 要等 20 s 才放弃，并以 internal "Event windowOpen did not fire" 报出
+// （线上出现过 6 次，原因没复现出来）。这里 5 s 就停，返回 no_window 并附位置 / 眼睛距离，方便排查。
+async function openTable(s, table) {
+  let timedOut = false
+  const p = s.bot.openBlock(table)
+  p.then(w => { if (timedOut && s.bot && s.bot.currentWindow === w) s.bot.closeWindow(w) }, () => {})
+  try {
+    return await withTimeout(p, 5000, 'opening the crafting table')
+  } catch (e) {
+    if (e.code !== 'timeout') throw e
+    timedOut = true
+    fail('no_window', `crafting table at ${table.position} did not open (server ignored the click)`, {
+      table: [table.position.x, table.position.y, table.position.z], pos: fmt(s.bot.entity.position), eye_dist: +eyeToBlock(s, table.position).toFixed(2)
+    })
+  }
 }
 
 function nearestBlockOf(s, names, maxDistance = 32) {
@@ -1654,6 +1700,24 @@ async function opText(s, w, kind, { value }) {
 
 const WINDOW_OPS = { put: opPut, take: opTake, select: opSelect, text: opText }
 
+// 从结果格 shift-click 取出产物，确认真的进了背包。背包满（又没有能叠加的同种堆）时服务器不动物品，
+// 以前会当作成功再请求 64 轮，卡 30 多秒后报 missing_ingredients "could not craft X: null"。
+// 工作台界面开着时 bot.inventory 要等关窗才同步，所以数的是当前窗口里背包那几格。
+async function takeCraftResult(s, win, id) {
+  const count = () => win.slots.slice(win.inventoryStart, win.inventoryEnd).reduce((n, it) => n + (it && it.type === id ? it.count : 0), 0)
+  const had = count()
+  await s.bot.clickWindow(0, 0, 1)
+  for (let i = 0; i < 8; i++) {
+    await sleep(i ? 100 : 250)
+    if (count() > had) return true
+  }
+  return false
+}
+
+function failInventoryFull(s, name, made) {
+  fail('inventory_full', `no room in the inventory for ${name} (free a slot or drop something)`, { gained: made, empty_slots: s.bot.inventory.emptySlotCount(), inventory: invCounts(s.bot) })
+}
+
 function missingIngredients(s, recipe) {
   const needs = {}
   for (const d of (recipe.delta || [])) if (d.count < 0) { const n = s.mcData.items[d.id].name; needs[n] = (needs[n] || 0) - d.count }
@@ -1663,10 +1727,11 @@ function missingIngredients(s, recipe) {
 async function craftManually(s, it, count, table, known) {
   const before = invCounts(s.bot)[it.name] || 0
   const gridW = table ? 3 : 2
+  let full = false
   for (let round = 0; round < 64 && (invCounts(s.bot)[it.name] || 0) - before < count; round++) {
     const recipe = s.bot.recipesFor(it.id, null, 1, table)[0]
     if (!recipe) break
-    const win = table ? await s.bot.openBlock(table) : s.bot.inventory
+    const win = table ? await openTable(s, table) : s.bot.inventory
     const gridSize = gridW * gridW
     const invStart = table ? win.inventoryStart : 9
     try {
@@ -1682,14 +1747,15 @@ async function craftManually(s, it, count, table, known) {
       }
       for (let i = 0; i < 10 && !win.slots[0]; i++) await sleep(100)
       if (!win.slots[0] || win.slots[0].type !== it.id) break
-      await s.bot.clickWindow(0, 0, 1); await sleep(300)
+      if (!await takeCraftResult(s, win, it.id)) { full = true; break }
     } finally {
       for (let sl = 1; sl <= gridSize; sl++) if (win.slots[sl]) { await s.bot.clickWindow(sl, 0, 1).catch(() => {}); await sleep(80) }
       if (table) s.bot.closeWindow(win)
     }
   }
-  await sleep(1500)
+  if (!full) await sleep(1500)
   const made = (invCounts(s.bot)[it.name] || 0) - before
+  if (full && made < count) failInventoryFull(s, it.name, made)
   if (made <= 0) fail('missing_ingredients', `could not craft ${it.name}`, { example_recipe_needs: missingIngredients(s, known[0]), inventory: invCounts(s.bot) })
   return { crafted: it.name, gained: made, used_table: !!table, method: 'manual', inventory: invCounts(s.bot) }
 }
@@ -1916,7 +1982,7 @@ const api = {
       if (block.name.endsWith('air')) fail('nothing_to_dig', `block at ${p} is ${block.name}`)
     }
     if (!block.diggable) fail('undiggable', `${block.name} is not diggable`)
-    await goNear(s, p, 3.5)
+    await goNear(s, p, 3.5, 60000, 5.0)
     const best = s.bot.pathfinder.bestHarvestTool(block)
     const tool = best && /_(pickaxe|axe|shovel|hoe|sword)$|^shears$/.test(best.name) ? best : null
     if (tool) await s.bot.equip(tool, 'hand')
@@ -1969,6 +2035,17 @@ const api = {
     const cur = s.bot.blockAt(target)
     if (cur && cur.boundingBox !== 'empty') fail('occupied', `${cur.name} already at target`)
     const it = findItem(s, item)
+    // 睡莲 / 蛙卵只能放在水面上：没有"贴着实心方块放"这回事，按视线对着下面的水用
+    if (item === 'lily_pad' || item === 'frogspawn') {
+      const water = waterAimTarget(s, target, item)
+      if (!water) fail('no_support', `${item} must be placed on a water source (the block below the target)`)
+      await goNear(s, water, 3, 60000, 4.5)
+      await s.bot.equip(it, 'hand')
+      const r = await useBucket(s, water, item)
+      const now = s.bot.blockAt(target)
+      if (!now || now.name !== item) fail('place_failed', `server did not place ${item}`, r)
+      return { placed: now.name, pos: [x, y, z], sneaked: false }
+    }
     const faces = [[0, -1, 0], [1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1], [0, 1, 0]].map(a => new Vec3(...a))
     let ref = null; let face = null
     for (const f of faces) {
@@ -1976,7 +2053,7 @@ const api = {
       if (r && r.boundingBox === 'block') { ref = r; face = f.scaled(-1); break }
     }
     if (!ref) fail('no_support', 'no solid neighbour block to place against')
-    await goNear(s, target, 3.5)
+    await goNear(s, target, 3.5, 60000, 5.0)
     if (s.bot.entity.position.floored().equals(target) || s.bot.entity.position.floored().offset(0, 1, 0).equals(target)) fail('blocked_by_self', 'bot is standing in target cell')
     await s.bot.equip(it, 'hand')
     // 放置瞬间潜行：对着箱子/工作台/熔炉/床这类可交互方块右键时，只有潜行才会真的"放置"而不是打开界面。
@@ -2028,7 +2105,10 @@ const api = {
       return { slept: false, interacted: true, daytime: !night }
     }
     if (item) await s.bot.equip(findItem(s, item), 'hand')
-    if (item && /bucket$/.test(item) && item !== 'milk_bucket') return await useBucket(s, p, item)
+    // 炼药锅的装 / 舀是方块交互（右键方块包），其他桶都走视线判定
+    if (item && /bucket$/.test(item) && item !== 'milk_bucket' && !/cauldron$/.test(block.name)) return await useBucket(s, p, item)
+    const waterAt = item && waterAimTarget(s, p, item)
+    if (waterAt) return await useBucket(s, waterAt, item)
     const above = p.offset(0, 1, 0)
     const upBefore = s.bot.blockAt(above)
     const invBefore = invCounts(s.bot)
@@ -2184,10 +2264,11 @@ const api = {
     const before = invCounts(s.bot)[item] || 0
     let made = 0
     let lastErr = null
-    for (let round = 0; made < count && round < 64; round++) {
+    let full = false
+    for (let round = 0; made < count && round < 64 && !full; round++) {
       let gotOne = false
       for (const [displayId, r] of entries) {
-        const win = table ? await s.bot.openBlock(table) : null
+        const win = table ? await openTable(s, table) : null
         const windowId = win ? win.id : 0
         const resultSlots = () => (win || s.bot.inventory).slots[0]
         try {
@@ -2195,20 +2276,20 @@ const api = {
           for (let i = 0; i < 10 && !resultSlots(); i++) await sleep(100)
           const res = resultSlots()
           if (res && res.type === it.id) {
-            await s.bot.clickWindow(0, 0, 1)
-            await sleep(250)
-            gotOne = true
+            if (await takeCraftResult(s, win || s.bot.inventory, it.id)) gotOne = true
+            else full = true
           } else lastErr = 'server placed no result'
         } finally {
           if (win) s.bot.closeWindow(win)
           else for (let sl = 1; sl <= 4; sl++) if (s.bot.inventory.slots[sl]) await s.bot.clickWindow(sl, 0, 1).catch(() => {})
           await sleep(150)
         }
-        if (gotOne) break
+        if (gotOne || full) break
       }
       made = (invCounts(s.bot)[item] || 0) - before
       if (!gotOne) break
     }
+    if (full) failInventoryFull(s, item, made)
     if (made <= 0) {
       const r = known[0]
       const needs = {}
@@ -2482,7 +2563,7 @@ const api = {
     }
 
     // 打火石、水桶这类必须对着方块用的东西，引导到 /interact
-    if (/bucket$|flint_and_steel$|_seeds$|bone_meal$|_hoe$/.test(item)) {
+    if (/bucket$|flint_and_steel$|_seeds$|bone_meal$|_hoe$|^glass_bottle$|^lily_pad$|^frogspawn$/.test(item)) {
       fail('need_block_target', `${item} must be used on a block; call /interact with x,y,z and this item`)
     }
     fail('cannot_use', `${item} has no known air-use behaviour`)

@@ -179,6 +179,9 @@ async function handleRequest (req, res) {
     session.log('API', name, 'OK', Date.now() - t0 + 'ms')
     send(200, { ok: true, ms: Date.now() - t0, result })
   } catch (e) {
+    // 动作进行中 bot 被 /disconnect、踢出或断线：s.bot 变成 null，动作里随后的属性访问会抛 TypeError，
+    // 以前报成 internal "Cannot read properties of null (reading 'pathfinder')"
+    if (isAction && !session.bot && !e.code) e = new ApiError('not_connected', `bot disconnected while ${name} was running`)
     if (isAction && session.bot && (!session.alive || session.bot.health <= 0)) session.interruptedBy = 'death'
     if (isAction && session.interruptedBy && !['interrupted', 'dead'].includes(e.code)) {
       const inner = e

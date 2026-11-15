@@ -1246,6 +1246,107 @@ def t_dig_enchanted():
         clean_player()
 
 
+@test("water_aim")
+def t_water_aim():
+    """玻璃瓶装水 / 睡莲走 use_item + 视线判定（以前 changed:false 什么都没发生）；
+    桶对炼药锅仍是方块交互（1.3.8 起桶全走视线判定，倒进炼药锅会倒在它上面）。"""
+    goto_home()
+    hx, _, hz = HOME
+    F = Y - 1
+    src, cz = [hx + 3, F, hz], [hx + 3, Y, hz + 3]
+    rcon(f"setblock {src[0]} {F} {src[2]} water")
+    rcon(f"setblock {cz[0]} {Y} {cz[2]} cauldron")
+    try:
+        for _ in range(20):
+            if block_at(*src)["name"] == "water" and block_at(*cz)["name"] == "cauldron":
+                break
+            time.sleep(0.25)
+        give("glass_bottle 2", "lily_pad 2", "water_bucket")
+        r1 = ok("interact", {"pos": src, "item": "glass_bottle"})
+        pots = [i for i in inv()["items"] if i["name"] == "potion"]
+        check(r1.get("gained", {}).get("potion") == 1 and pots and pots[0].get("potion") == "water", f"glass bottle did not fill: {r1}")
+        r2 = ok("place", {"item": "lily_pad", "pos": [src[0], Y, src[2]]})
+        check(block_at(src[0], Y, src[2])["name"] == "lily_pad", f"lily pad was not placed on the water: {r2}")
+        r3 = ok("interact", {"pos": cz, "item": "water_bucket"})
+        check(block_at(*cz)["name"] == "water_cauldron" and block_at(cz[0], Y + 1, cz[2])["name"] == "air", f"water bucket did not fill the cauldron: {r3}")
+        r4 = ok("interact", {"pos": cz, "item": "bucket"})
+        check(block_at(*cz)["name"] == "cauldron" and counts().get("water_bucket") == 1, f"empty bucket did not take water from the cauldron: {r4}")
+        hint = call("use_item", {"item": "glass_bottle"})
+        check(not hint.get("ok") and hint["error"]["code"] == "need_block_target", f"use_item glass_bottle should point to /interact: {hint}")
+        return {"bottle": r1, "lily": r2, "cauldron_in": r3.get("after"), "cauldron_out": r4.get("after")}
+    finally:
+        rcon(f"fill {hx - 4} {Y} {hz - 4} {hx + 6} {Y + 2} {hz + 4} air")
+        rcon(f"fill {hx - 4} {F} {hz - 4} {hx + 6} {F} {hz + 4} stone")
+        clean_player()
+
+
+@test("dig_reach")
+def t_dig_reach():
+    """斜下方 (1,-3,3) 的方块：脚到方块角 < 4 但眼睛到中心 > 5.1。以前 goNear 直接认为够得着、
+    dig 原地 1 ms 报 out_of_reach（线上出现过 62 次）；现在要走过去挖掉。"""
+    goto_home()
+    hx, _, hz = HOME
+    tx, ty, tz = hx + 1, Y - 3, hz + 3
+    rcon(f"fill {hx - 2} {Y - 4} {hz - 2} {hx + 4} {Y - 2} {hz + 5} stone")
+    rcon(f"fill {tx} {Y - 2} {tz} {tx} {Y - 1} {tz} air")   # 挖出一条槽让目标露出来
+    try:
+        give("iron_pickaxe")
+        for _ in range(20):
+            if block_at(tx, ty, tz)["name"] == "stone" and block_at(tx, Y - 1, tz)["name"] == "air":
+                break
+            time.sleep(0.25)
+        r = ok("dig", {"pos": [tx, ty, tz]})
+        check(r.get("dug") == "stone", f"diagonal-below block was not dug: {r}")
+        return {"dig_ms": r.get("dig_ms"), "pos_after": status()["pos"]}
+    finally:
+        goto_home()   # 先回台面，再补地板、清掉下面的石头（bot 可能还站在槽里）
+        rcon(f"fill {hx - 4} {Y - 1} {hz - 4} {hx + 6} {Y - 1} {hz + 6} stone")
+        rcon(f"fill {hx - 2} {Y - 4} {hz - 2} {hx + 4} {Y - 2} {hz + 5} air")
+        clean_player()
+
+
+@test("craft")
+def t_craft():
+    """合成全流程：2x2（木板 / 木棍 / 工作台）→ 放下工作台 → 立刻用它合成（配方书路径：木镐 x2；手动摆放路径：箱子）。
+    线上出现过"放下工作台后马上 craft → 20 s 后 internal windowOpen did not fire"。"""
+    goto_home()
+    hx, _, hz = HOME
+    try:
+        clean_player()
+        give("oak_log 6")
+        out = {}
+        # count 是要得到的物品数：24 木板 = 6 次合成；木棍 4 = 1 次（2 木板）；工作台 4、木镐 x2 共 6、箱子 8，合计 20 木板
+        for item, n in (("oak_planks", 24), ("stick", 4), ("crafting_table", 1)):
+            r = ok("craft", {"item": item, "count": n})
+            check(r.get("gained", 0) >= 1, f"craft {item} gained nothing: {r}")
+            out[item] = r.get("gained")
+        check(call("craft", {"item": "wooden_pickaxe"}).get("error", {}).get("code") == "need_crafting_table",
+              "wooden_pickaxe without a table should need_crafting_table")
+        p = ok("place", {"item": "crafting_table", "pos": [hx + 2, Y, hz]})
+        t0 = time.time()
+        r = ok("craft", {"item": "wooden_pickaxe", "count": 2})
+        check(r.get("used_table") and r.get("gained") == 2, f"wooden_pickaxe via table failed: {r}")
+        out["pickaxe_ms"] = int((time.time() - t0) * 1000)
+        r = ok("craft", {"item": "chest"})
+        check(r.get("gained") == 1, f"chest via table failed: {r}")
+        out["chest_method"] = r.get("method", "recipe_book")
+        out["placed"] = p.get("placed")
+        # 背包满：以前空转 64 轮、32 s 后报 missing_ingredients "could not craft oak_planks: null"
+        clean_player()
+        give("oak_log 2")
+        for _ in range(35):
+            give("stone 64")
+        time.sleep(0.8)
+        t0 = time.time()
+        e = call("craft", {"item": "oak_planks"}).get("error") or {}
+        out["full_ms"] = int((time.time() - t0) * 1000)
+        check(e.get("code") == "inventory_full" and out["full_ms"] < 5000, f"full inventory craft: {e} in {out['full_ms']} ms")
+        return out
+    finally:
+        rcon(f"setblock {hx + 2} {Y} {hz} air")
+        clean_player()
+
+
 @test("events")
 def t_events():
     ev = ok("events", {"since": 0, "limit": 500})
