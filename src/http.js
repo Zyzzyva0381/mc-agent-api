@@ -213,6 +213,13 @@ function sweep () {
 function start () {
   const server = http.createServer(handleRequest)
   server.listen(config.http.port, config.http.host, () => log('Multi-instance API listening on', config.http.host + ':' + config.http.port))
+  // Windows 上 localhost 先解析成 ::1。只监听 IPv4 时，客户端用 http://localhost:... 每建一个新连接都要先在 ::1 上白等
+  // （Node 20+ fetch 约 250 ms 才回落到 IPv4，Python urllib / requests 约 2 s）。监听回环或全部地址时顺带监听 ::1。
+  if (['127.0.0.1', '0.0.0.0', 'localhost'].includes(config.http.host)) {
+    const v6 = http.createServer(handleRequest)
+    v6.on('error', e => log('IPv6 loopback listener not started:', e.code || e.message))
+    v6.listen({ port: config.http.port, host: '::1', ipv6Only: true }, () => log('Also listening on [::1]:' + config.http.port + ' (so http://localhost works without the IPv6 fallback delay)'))
+  }
   setInterval(sweep, 60000).unref()
   log('Server started, waiting for logins...')
   return server

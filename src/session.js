@@ -2623,7 +2623,8 @@ const api = {
       s.bot.setControlState('jump', wantJump)
       s.posture.jump = wantJump
     }
-    await sleep(150)
+    // 潜行 / 跳跃随下一个物理 tick（50 ms）发出，举盾的 use_item 是立即发的；以前固定等 150 ms，战斗里每次切姿态白白多 100 ms
+    await sleep(55)
     return {
       sneaking: !!s.bot.getControlState('sneak'),
       jumping: !!s.bot.getControlState('jump'),

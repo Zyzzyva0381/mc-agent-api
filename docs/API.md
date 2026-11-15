@@ -7,6 +7,7 @@
 - **Base URL**：`http://<部署地址>:18900/api/v1`（端口见 `config.json` 的 `http.port`；对公网开放时请放在 HTTPS 反向代理后面）
 - **协议**：HTTP + JSON
 - **认证**：Bearer Token（`/auth/login` 换取；账号体系由部署方的认证适配器决定，见 `docs/ADAPTERS.md`）
+- **自己本机部署开源版时**：服务器内部处理很快（`status` / `get_block` 约 1 ms，`/control` 只比 `ms` 多 1–2 ms，`/posture` 约 55 ms）。如果你测到的延迟大很多，先查客户端：**用 `127.0.0.1` 而不是 `localhost`**（1.3.12 前服务只监听 IPv4，Windows 上 `localhost` 先试 IPv6，每个新连接白等约 0.25 s（Node fetch）到 2 s（Python））；**复用连接**（Python 用 `requests.Session()`，不要每次新建）；bot 本身到游戏服务器的网络延迟也会体现在动作效果上
 - **并发**：每个 token 对应一个独立的 bot 实例
 - **动作互斥**：同一时间只能执行一个动作，重复调用返回 `busy`
 
@@ -709,7 +710,7 @@ POST /posture  {}
 ```
 
 - **全量设置**：每次调用表达"我现在要的姿态"，没写的字段就是 `false`；`{}` 表示全部复位。
-- **不占动作锁**：可以在 `move_to` 执行中途调用。
+- **不占动作锁**：可以在 `move_to` 执行中途调用。约 55 ms 返回（等一个游戏 tick 让潜行 / 跳跃发出去；举盾是立即发的）。
 - `sneak`：搭桥（`posture{sneak:true}` → `place` → `move_to` 循环）、经过 sculk sensor、原地潜行。
 - `shield`：副手自动装备盾牌（背包里没有则 `missing_item`），举盾会取消疾跑。
 - `jump`：**持续按住跳跃**。在水里等于自动踩水浮面（`posture{jump:true}` 之后可以一直停在水面，不会沉底溺亡）；陆地上会持续起跳，配合 `place` 可以原地垫高。
@@ -933,6 +934,7 @@ curl -s -X POST http://127.0.0.1:18900/api/v1/posture \
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 1.3.12 | 2026-11-15 | 延迟：① 服务监听 `127.0.0.1` 或 `0.0.0.0` 时额外监听 `[::1]`——以前 Windows 客户端用 `http://localhost:...` 时每个新连接先在 IPv6 上白等（实测 Python 2 s、Node 20+ fetch 约 0.25 s）；② `/posture` 固定等待 150 ms → 55 ms（一个 tick），服务器端实测每次都已看到潜行状态 |
 | 1.3.11 | 2026-11-15 | 修复背包满时物品被扔到地上：① `/window/act` `take` 从箱子 / 熔炉成品槽等取东西，以前把东西扔到地上并报 `missing_item` / `no_output` "nothing to take"（取 2 个也会把整组 5 个扔掉），现在只取放得下的量（部分成功带 `inventory_full: true`），一个都放不下时报 `inventory_full`、东西留在原处；② `/dig` 没有合适工具时会先把手上的东西收进背包，背包满时会把手上整组扔掉（实测 64 钻石），现在直接拿着它挖 |
 | 1.3.10 | 2026-11-14 | 修复：① `/dig` 挖**斜下方**的方块（例如脚下往外 1 格、往下 3 格、往前 3 格）原地 1 ms 返回 `out_of_reach`——"已经够得着"的判断按脚到方块角算，实际挖掘按眼睛到方块中心算，两者不一致；现在会先走过去；② `/interact` 用**玻璃瓶**对着水装水、放**睡莲 / 蛙卵**完全无效（`changed: false`）——现在和桶一样按视线判定，`/place` 也能放睡莲；③ 1.3.8 起**桶对炼药锅**会把水倒在炼药锅上面、空桶舀不出炼药锅里的水——炼药锅恢复为普通右键方块；④ 动作执行中途被 `/disconnect` 或断线时返回 `internal "Cannot read properties of null"`，现在返回 `not_connected`；⑤ `/craft` 打不开工作台时要等 20 s 才返回 `internal "Event windowOpen did not fire"`，现在 5 s 返回 `no_window` 并附坐标与距离；⑥ 背包满时 `/craft` 空转约 30 s 后报 `missing_ingredients "could not craft X: null"`（产物取不出来却当作成功，重试 64 轮），现在约 1 s 返回 `inventory_full` |
 | 1.3.9 | 2026-11-14 | 修复：手持**附魔工具**时 `/dig`（以及会顺路挖方块的寻路）返回 `internal`：`enchantments is not iterable`。1.21 物品组件下 prismarine-item 的 `item.enchants` 是对象而不是数组，mineflayer 算挖掘时间时遍历它就崩；附魔头盔则被静默忽略。现在附魔从物品组件读取，效率附魔也正确计入挖掘时间（效率 V 铁镐挖石头约 0.13 s，普通铁镐约 0.45 s） |
