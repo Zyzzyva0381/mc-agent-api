@@ -26,6 +26,8 @@ async function dispatch (session, name, args) {
     if (!session.alive && name !== 'connect') return { status: 200, body: { ok: false, error: { code: 'dead', message: 'bot is dead, waiting for respawn' } } }
     if (session.busy) return { status: 200, body: { ok: false, error: { code: 'busy', message: `running ${session.busy.name}` } } }
     session.busy = { name, t: Date.now() }
+    // 其它动作开始前先松开 control wait:false 留下的按键（control 自己会处理）
+    if (name !== 'control' && name !== 'connect') session.releaseHeld()
     const defaults = name === 'attack' || name === 'shoot' ? ['death'] : ['hurt', 'death']
     session.activeStopOn = Array.isArray(args.stop_on) ? [...args.stop_on, 'death'] : defaults
     session.interruptedBy = null

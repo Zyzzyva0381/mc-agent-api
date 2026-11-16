@@ -7,7 +7,7 @@
 - **Base URL**：`http://<部署地址>:18900/api/v1`（端口见 `config.json` 的 `http.port`；对公网开放时请放在 HTTPS 反向代理后面）
 - **协议**：HTTP + JSON
 - **认证**：Bearer Token（`/auth/login` 换取；账号体系由部署方的认证适配器决定，见 `docs/ADAPTERS.md`）
-- **自己本机部署开源版时**：服务器内部处理很快（`status` / `get_block` 约 1 ms，`/control` 只比 `ms` 多 1–2 ms，`/posture` 约 55 ms）。如果你测到的延迟大很多，先查客户端：**用 `127.0.0.1` 而不是 `localhost`**（1.3.12 前服务只监听 IPv4，Windows 上 `localhost` 先试 IPv6，每个新连接白等约 0.25 s（Node fetch）到 2 s（Python））；**复用连接**（Python 用 `requests.Session()`，不要每次新建）；bot 本身到游戏服务器的网络延迟也会体现在动作效果上
+- **自己本机部署开源版时**：服务器内部处理很快（`status` / `get_block` 约 1 ms，`/control` 只比 `ms` 多 1–2 ms，`/control` 带 `"wait": false` 时约 1 ms，`/posture` 约 55 ms）。如果你测到的延迟大很多，先查客户端：**用 `127.0.0.1` 而不是 `localhost`**（1.3.12 前服务只监听 IPv4，Windows 上 `localhost` 先试 IPv6，每个新连接白等约 0.25 s（Node fetch）到 2 s（Python））；**复用连接**（Python 用 `requests.Session()`，不要每次新建）；bot 本身到游戏服务器的网络延迟也会体现在动作效果上
 - **并发**：每个 token 对应一个独立的 bot 实例
 - **性能隔离**：每个 bot 跑在服务端自己的进程里，别的 bot 在寻路、大范围查找方块时不影响你的请求延迟（23 个 bot 同时满负荷实测：`status` p99 约 50 ms）
 - **动作互斥**：同一时间只能执行一个动作，重复调用返回 `busy`
@@ -206,6 +206,7 @@ GET /status
 | `in_lava` | 是否站在岩浆里 |
 | `in_vehicle` | `{"id","name"}` 或 `null` |
 | `sneaking` / `jumping` / `blocking` | 当前姿态，与 `/posture` 对应（`jumping` 为持续按住跳跃，水里即踩水浮面） |
+| `held_controls` | `/control` `wait:false` 正在按住的键：`{"keys": ["forward"], "release_in_ms": 120}`；没有时为 `null` |
 | `using_item` | 正在使用物品时返回 `{"name","elapsed_ms"}` |
 | `nearest_hostile` | 24 格内最近的敌对生物，没有则省略 |
 | `last_death` | 最近一次死亡的位置、时间、死亡信息 |
@@ -816,6 +817,8 @@ POST /stop
 POST /control  {"forward": true, "jump": true, "yaw": 1.57, "ms": 400}
 POST /control  {"hit": true, "yaw": 1.57, "pitch": -0.2}
 POST /control  {"jump": true, "hit": 1, "hit_interval_ms": 450, "ms": 500}
+POST /control  {"forward": true, "sprint": true, "yaw": 0.8, "ms": 200, "wait": false}
+POST /control  {"wait": false}
 ```
 
 不经过 mineflayer-pathfinder 的原生按键控制：后端 `setControlState` 按住指定键 `ms` 毫秒后自动松开，返回位移。用于 A* 处理不了的中间态：
@@ -833,6 +836,7 @@ POST /control  {"jump": true, "hit": 1, "hit_interval_ms": 450, "ms": 500}
 | `hit` | 可选，`true` = 挥 1 下，整数 1–20 = 挥 N 下；第一下在开始时立即挥出 |
 | `hit_interval_ms` | 两下之间的间隔，50–5000；默认按手持物品的原版攻击冷却（空手及非工具物品 250 / 剑 625 / 镐 833 / 锹 1000 / 斧 1000–1250、锄 250–1000 按材质 / 三叉戟 909 / 重锤 1667）。比冷却短也会照发，但原版伤害会按冷却进度打折 |
 | `ms` | 按住时长，50–3000；默认 300，只给 `hit` 时默认刚好够挥完（`(hit-1)×间隔+50`）。给了 `ms` 但不够挥完会返回 `bad_args`（附 `required_ms`） |
+| `wait` | 默认 `true`：按满 `ms` 再返回。`false`：**按下就返回**（服务端约 1 ms），键在后台按住 `ms` 后自动松开——见下面"实时操控" |
 
 方向键和 `hit` 至少给一个。每一下按原版左键判定：从眼睛沿视线找 **3 格**内最近的实体判定箱（被方块挡住的不算；掉落物、经验球、箭等原版打不到的实体会跳过；船、矿车、末影水晶都能打到），命中就攻击，否则只挥手——**不会挖方块**，挖掘请用 `/dig`。`hits[].entity` 只说明攻击包发给了谁，伤害由服务端按原版规则结算：同一目标受击后有 0.5 秒无敌帧（间隔 < 500ms 时中间那几下通常不掉血），冷却没转满伤害打折，下落中命中才是暴击。
 
@@ -846,6 +850,15 @@ POST /control  {"jump": true, "hit": 1, "hit_interval_ms": 450, "ms": 500}
 没命中时那一下是 `{"t_ms": 0, "entity": null, "block": {"name": "stone", "pos": [445, 63, 218]}}`（视线 3 格内没有方块则没有 `block`）。
 
 动作锁语义与其它动作一致（会占用动作锁，有别的动作在跑时返回 `busy`，要先 `/stop`；默认 `stop_on` 含 `hurt`——近身对打时建议传 `"stop_on": []`）；结束时会重放当前 `/posture`。
+
+**实时操控（`"wait": false`）**：按下指定键、转好视角、挥出第一下就立刻返回，不等 `ms`。适合 agent 按自己的节奏（例如每 50–100 ms 一次）连续发指令，像玩家按住键一样操控：
+
+- 键在后台按住 `ms` 毫秒后自动松开；`hit` 大于 1 时后面几下按间隔在后台挥出。返回 `{"held": ["forward", "sprint"], "release_in_ms": 200, "pos": …, "on_ground": …, "yaw": …, "pitch": …}`（有 `hit` 时另带第一下的 `hits` 和 `scheduled_hits`）。
+- **新的 `/control` 立刻接管**：先松开上一次留下的键（以及没挥完的几下），再按新的。想一直走就在松开前续上，例如每 100 ms 发一次 `ms: 200`。
+- `{"wait": false}` 什么键都不给 = 立刻全部松开（返回 `released`）。`/stop`、死亡、开始任何其它动作（`move_to`、`dig`……）也会先松开。
+- 只在设置按键的那一刻占用动作锁，返回后锁就释放了：按住期间可以调 `/look`、`/posture`、观察接口，也可以开始别的动作（会先松开按键）。
+- `/status.held_controls` 显示当前按住的键和剩余毫秒（没有时为 `null`）。
+- 键的效果从下一个物理 tick（≤ 50 ms）开始；客户端到 API 的网络往返（校内约 0.1 s，公网 0.5–1 s）仍然要算上，所以离 API 越近越"实时"。
 
 ### 4.17 主动转向
 
@@ -935,6 +948,7 @@ curl -s -X POST http://127.0.0.1:18900/api/v1/posture \
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 1.3.14 | 2026-11-16 | 新增 `/control` `"wait": false`（实时操控）：按下就返回（服务端约 1 ms，以前要等满 `ms`），键在后台按住 `ms` 后松开，下一个 `/control` 立刻接管；`{"wait": false}` 空调用立即松开；`/status` 新增 `held_controls` |
 | 1.3.13 | 2026-11-16 | 23 个 bot 压测后的修复：① **每个 bot 一个进程**——以前所有 bot 共用一个 Node 线程，任何一个 bot 寻路或大范围 `find_blocks` 都会拖慢所有人，23 个 bot 同时干活时 `status` p99 4.5 s、`control` p99 4 s；现在同样负载下 `status` p99 3 ms、`control`（ms=100）p99 106 ms，全部 bot 满负荷重计算时 `status` p99 约 50 ms；② 后端在线人数超过 13 时，服务器 RCON `list` 只列前 13 个名字，之后的 bot 会被误判为"不在后端"而反复 `/server`、断线重登（在线人数在 20–23 之间跳）——现在被截断时逐个确认；③ `find_blocks` 改为直接按方块状态扫描并分段让出：半径 64 从约 0.4–3.6 s 降到约 0.1 s；以前的实现按区块"八面体"遍历，会漏掉对角方向、但仍在半径内的方块，现在结果更完整（数量会比以前多）；④ 重连途中调用 `get_block` / `find_blocks` / `get_entities` / `inventory` 返回 `not_ready`，以前是 `internal`；⑤ 寻路每个 tick 最多计算 20 ms（以前 40 ms） |
 | 1.3.12 | 2026-11-15 | 延迟：① 服务监听 `127.0.0.1` 或 `0.0.0.0` 时额外监听 `[::1]`——以前 Windows 客户端用 `http://localhost:...` 时每个新连接先在 IPv6 上白等（实测 Python 2 s、Node 20+ fetch 约 0.25 s）；② `/posture` 固定等待 150 ms → 55 ms（一个 tick），服务器端实测每次都已看到潜行状态 |
 | 1.3.11 | 2026-11-15 | 修复背包满时物品被扔到地上：① `/window/act` `take` 从箱子 / 熔炉成品槽等取东西，以前把东西扔到地上并报 `missing_item` / `no_output` "nothing to take"（取 2 个也会把整组 5 个扔掉），现在只取放得下的量（部分成功带 `inventory_full: true`），一个都放不下时报 `inventory_full`、东西留在原处；② `/dig` 没有合适工具时会先把手上的东西收进背包，背包满时会把手上整组扔掉（实测 64 钻石），现在直接拿着它挖 |

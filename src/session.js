@@ -50,6 +50,8 @@ class Session {
     this.advancementsUpdatedAt = null
     // 持久姿态（不占动作锁）：潜行 + 举盾。全量设置语义，见 api.posture
     this.posture = { sneak: false, shield: false, jump: false }
+    // /control wait:false 留下的按键：到点自动松开；新的 control、其它动作、stop、死亡都会先松开
+    this.heldControl = null
     // 正在使用物品的时长统计（status.using_item）
     this.usingItem = null
     // 连接自愈（hardReconnect）：适配器发现连接与服务器状态脱节时，可以要求整条连接重登
@@ -115,9 +117,20 @@ class Session {
   applyPosture() {
     const b = this.bot
     if (!b || !b.entity) return
-    try { b.setControlState('sneak', !!this.posture.sneak) } catch {}
-    try { b.setControlState('jump', !!this.posture.jump) } catch {}
+    const held = this.heldControl ? this.heldControl.keys : []
+    try { b.setControlState('sneak', !!this.posture.sneak || held.includes('sneak')) } catch {}
+    try { b.setControlState('jump', !!this.posture.jump || held.includes('jump')) } catch {}
     if (this.posture.shield) { try { b.activateItem(true) } catch {} }
+  }
+
+  releaseHeld() {
+    const h = this.heldControl
+    if (!h) return
+    this.heldControl = null
+    clearTimeout(h.timer)
+    for (const t of h.hitTimers) clearTimeout(t)
+    if (this.bot) for (const k of h.keys) { try { this.bot.setControlState(k, false) } catch {} }
+    this.applyPosture()
   }
 
   clearPosture() {
@@ -434,7 +447,7 @@ class Session {
     const DEATH_LOOP_COOLDOWN = 5 * 60 * 1000
     s.bot.on('death', () => {
       s.lastDeath = { pos: fmt(s.bot.entity.position), t: Date.now(), dropped_items_at: fmt(s.bot.entity.position) }
-      s.pushEvent('death', s.lastDeath); s.alive = false; s.interrupt('death')
+      s.pushEvent('death', s.lastDeath); s.alive = false; s.releaseHeld(); s.interrupt('death')
       s.clearPosture()
       const now = Date.now()
       s.recentDeaths.push(now)
@@ -1887,6 +1900,7 @@ const api = {
       in_lava: !!feet && feet.name === 'lava',
       in_vehicle: vehicle ? { id: vehicle.id, name: vehicle.name } : null,
       sneaking: !!b.getControlState('sneak'),
+      held_controls: s.heldControl ? { keys: s.heldControl.keys, release_in_ms: Math.max(0, s.heldControl.until - Date.now()) } : null,
       jumping: !!b.getControlState('jump'),
       blocking: !!(s.posture.shield && b.inventory.slots[45] && b.inventory.slots[45].name === 'shield'),
       using_item: s.usingItem ? { name: s.usingItem.name, elapsed_ms: Date.now() - s.usingItem.t } : null,
@@ -2772,8 +2786,9 @@ const api = {
   // 不经过 pathfinder 的原生键位控制：受控时长内按住指定方向/跳跃，可选在此期间按左键（hit）。
   // 用于脱离船体碰撞箱、水中上浮、助跑跳沟、原地跳配合 place 垫高、跳劈暴击、朝固定方向挥砍
   // 这类 A* / attack 处理不了的中间态。
-  async control(s, { forward, back, left, right, jump, sneak, sprint, yaw, pitch, ms, hit, hit_interval_ms }) {
+  async control(s, { forward, back, left, right, jump, sneak, sprint, yaw, pitch, ms, hit, hit_interval_ms, wait }) {
     if (!s.bot || !s.bot.entity) fail('not_connected', 'bot not connected')
+    if (wait !== undefined && typeof wait !== 'boolean') fail('bad_args', 'wait must be a boolean')
     const keys = ['forward', 'back', 'left', 'right', 'jump', 'sneak', 'sprint']
     const want = {}
     for (const k of keys) {
@@ -2786,7 +2801,15 @@ const api = {
       hits = hit === true ? 1 : Number(hit)
       if (!Number.isInteger(hits) || hits < 1 || hits > 20) fail('bad_args', 'hit must be true or an integer between 1 and 20')
     }
-    if (!keys.some(k => want[k]) && !hits) fail('bad_args', 'set at least one of forward/back/left/right/jump/sneak/sprint or hit')
+    if (!keys.some(k => want[k]) && !hits) {
+      // wait:false 且什么键都不按：立刻松开之前留下的按键
+      if (wait === false && yaw === undefined && pitch === undefined) {
+        const had = s.heldControl ? s.heldControl.keys : []
+        s.releaseHeld()
+        return { held: [], released: had, pos: fmt(s.bot.entity.position), on_ground: !!s.bot.entity.onGround }
+      }
+      if (wait !== false) fail('bad_args', 'set at least one of forward/back/left/right/jump/sneak/sprint or hit')
+    }
     let interval = 0
     if (hits) {
       interval = hit_interval_ms === undefined ? attackIntervalMs(s.bot.heldItem) : Number(hit_interval_ms)
@@ -2802,6 +2825,28 @@ const api = {
       const np = Number(pitch ?? s.bot.entity.pitch)
       if (!Number.isFinite(ny) || !Number.isFinite(np)) fail('bad_args', 'yaw/pitch must be finite numbers (radians)')
       await s.bot.look(ny, np, true)
+    }
+    s.releaseHeld()
+    if (wait === false) {
+      // 不等：按下就返回，ms 后自动松开；下一个 control 会立刻接管（实时操控用）
+      const held = keys.filter(k => want[k])
+      const h = { keys: held, until: Date.now() + ms, timer: null, hitTimers: [] }
+      s.heldControl = h
+      for (const k of held) s.bot.setControlState(k, true)
+      const swings = hits ? [{ t_ms: 0, ...leftClick(s) }] : []
+      for (let i = 1; i < hits; i++) {
+        h.hitTimers.push(setTimeout(() => { if (s.heldControl === h && s.bot) { try { leftClick(s) } catch {} } }, i * interval))
+      }
+      h.timer = setTimeout(() => { if (s.heldControl === h) s.releaseHeld() }, ms)
+      return {
+        held, release_in_ms: ms,
+        pos: fmt(s.bot.entity.position),
+        on_ground: !!s.bot.entity.onGround,
+        in_water: !!s.bot.entity.isInWater,
+        yaw: +s.bot.entity.yaw.toFixed(2),
+        pitch: +s.bot.entity.pitch.toFixed(2),
+        ...(hits ? { hits: swings, scheduled_hits: hits - 1, hit_interval_ms: interval, held_item: s.bot.heldItem ? s.bot.heldItem.name : null } : {})
+      }
     }
     const before = s.bot.entity.position.clone()
     const t0 = Date.now()
@@ -2866,6 +2911,7 @@ const api = {
   async stop(s) {
     if (!s.bot) return { stopped: false }
     const running = s.busy
+    s.releaseHeld()
     if (running) s.interruptedBy = 'stop'
     s.bot.pathfinder.setGoal(null)
     try { s.bot.stopDigging() } catch {}

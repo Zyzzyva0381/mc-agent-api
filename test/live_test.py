@@ -982,6 +982,41 @@ def t_primitives():
     return out
 
 
+@test("control_async")
+def t_control_async():
+    """/control wait:false：立刻返回、按住期间继续走、到点松开；新调用接管；空调用 / 其它动作松开。"""
+    goto_home()
+    hx, _, hz = HOME
+    t0 = time.time()
+    r = ok("control", {"forward": True, "ms": 600, "yaw": 0, "pitch": 0, "wait": False})
+    rtt = (time.time() - t0) * 1000
+    check(rtt < 50 and r["held"] == ["forward"] and r["release_in_ms"] == 600, f"wait:false should return at once: {rtt:.0f} ms {r}")
+    s0 = status()
+    check(s0["held_controls"] and s0["held_controls"]["keys"] == ["forward"], f"status.held_controls: {s0.get('held_controls')}")
+    time.sleep(0.35)
+    s1 = status()
+    moved = abs(s1["pos"][2] - s0["pos"][2]) + abs(s1["pos"][0] - s0["pos"][0])
+    check(moved > 0.4, f"bot did not keep walking after wait:false returned: {moved}")
+    time.sleep(0.6)
+    s2 = status(); time.sleep(0.4); s3 = status()
+    check(s3["held_controls"] is None, f"keys not released after ms: {s3['held_controls']}")
+    check(abs(s3["pos"][2] - s2["pos"][2]) + abs(s3["pos"][0] - s2["pos"][0]) < 0.3, "bot kept moving after release")
+    # 接管：新的 wait:false 立刻替换按键
+    goto_home()
+    ok("control", {"forward": True, "ms": 2000, "yaw": 0, "pitch": 0, "wait": False})
+    r = ok("control", {"left": True, "sneak": True, "ms": 2000, "wait": False})
+    check(r["held"] == ["left", "sneak"] and status()["held_controls"]["keys"] == ["left", "sneak"], f"redirect: {r}")
+    r = ok("control", {"wait": False})
+    check(r["held"] == [] and status()["held_controls"] is None and not status()["sneaking"], f"empty wait:false should release: {r}")
+    # 其它动作开始时松开
+    ok("control", {"forward": True, "ms": 3000, "yaw": 1.57, "pitch": 0, "wait": False})
+    ok("move_to", {"pos": [hx + 0.5, Y, hz + 0.5], "range": 0.5})
+    check(status()["held_controls"] is None, "move_to should release held keys")
+    check(call("control", {"forward": True, "wait": "no"}).get("error", {}).get("code") == "bad_args", "wait must be boolean")
+    goto_home()
+    return {"rtt_ms": round(rtt, 1), "moved_while_held": round(moved, 2)}
+
+
 @test("control_hit")
 def t_control_hit():
     """/control 的 hit：按给定 yaw/pitch 原版左键，不寻路、不自动瞄准。
