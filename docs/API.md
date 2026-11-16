@@ -9,6 +9,7 @@
 - **认证**：Bearer Token（`/auth/login` 换取；账号体系由部署方的认证适配器决定，见 `docs/ADAPTERS.md`）
 - **自己本机部署开源版时**：服务器内部处理很快（`status` / `get_block` 约 1 ms，`/control` 只比 `ms` 多 1–2 ms，`/posture` 约 55 ms）。如果你测到的延迟大很多，先查客户端：**用 `127.0.0.1` 而不是 `localhost`**（1.3.12 前服务只监听 IPv4，Windows 上 `localhost` 先试 IPv6，每个新连接白等约 0.25 s（Node fetch）到 2 s（Python））；**复用连接**（Python 用 `requests.Session()`，不要每次新建）；bot 本身到游戏服务器的网络延迟也会体现在动作效果上
 - **并发**：每个 token 对应一个独立的 bot 实例
+- **性能隔离**：每个 bot 跑在服务端自己的进程里，别的 bot 在寻路、大范围查找方块时不影响你的请求延迟（23 个 bot 同时满负荷实测：`status` p99 约 50 ms）
 - **动作互斥**：同一时间只能执行一个动作，重复调用返回 `busy`
 
 ---
@@ -264,7 +265,7 @@ POST /find_blocks
 }}}
 ```
 
-约束：只返回**暴露方块**（至少一面邻接空气或透明方块），不提供矿透能力。
+约束：只返回**暴露方块**（至少一面邻接空气或透明方块），不提供矿透能力。范围是以 bot 为球心、半径 `radius` 的球；指定类型时最多统计最近的 10000 个，摘要模式最多统计最近的 4000 个（`scanned`）。半径 64 通常在 0.1 s 左右，扫描期间同一个 bot 的其它请求照常响应。
 
 ### 3.4 查询单个方块
 
@@ -934,6 +935,7 @@ curl -s -X POST http://127.0.0.1:18900/api/v1/posture \
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 1.3.13 | 2026-11-16 | 23 个 bot 压测后的修复：① **每个 bot 一个进程**——以前所有 bot 共用一个 Node 线程，任何一个 bot 寻路或大范围 `find_blocks` 都会拖慢所有人，23 个 bot 同时干活时 `status` p99 4.5 s、`control` p99 4 s；现在同样负载下 `status` p99 3 ms、`control`（ms=100）p99 106 ms，全部 bot 满负荷重计算时 `status` p99 约 50 ms；② 后端在线人数超过 13 时，服务器 RCON `list` 只列前 13 个名字，之后的 bot 会被误判为"不在后端"而反复 `/server`、断线重登（在线人数在 20–23 之间跳）——现在被截断时逐个确认；③ `find_blocks` 改为直接按方块状态扫描并分段让出：半径 64 从约 0.4–3.6 s 降到约 0.1 s；以前的实现按区块"八面体"遍历，会漏掉对角方向、但仍在半径内的方块，现在结果更完整（数量会比以前多）；④ 重连途中调用 `get_block` / `find_blocks` / `get_entities` / `inventory` 返回 `not_ready`，以前是 `internal`；⑤ 寻路每个 tick 最多计算 20 ms（以前 40 ms） |
 | 1.3.12 | 2026-11-15 | 延迟：① 服务监听 `127.0.0.1` 或 `0.0.0.0` 时额外监听 `[::1]`——以前 Windows 客户端用 `http://localhost:...` 时每个新连接先在 IPv6 上白等（实测 Python 2 s、Node 20+ fetch 约 0.25 s）；② `/posture` 固定等待 150 ms → 55 ms（一个 tick），服务器端实测每次都已看到潜行状态 |
 | 1.3.11 | 2026-11-15 | 修复背包满时物品被扔到地上：① `/window/act` `take` 从箱子 / 熔炉成品槽等取东西，以前把东西扔到地上并报 `missing_item` / `no_output` "nothing to take"（取 2 个也会把整组 5 个扔掉），现在只取放得下的量（部分成功带 `inventory_full: true`），一个都放不下时报 `inventory_full`、东西留在原处；② `/dig` 没有合适工具时会先把手上的东西收进背包，背包满时会把手上整组扔掉（实测 64 钻石），现在直接拿着它挖 |
 | 1.3.10 | 2026-11-14 | 修复：① `/dig` 挖**斜下方**的方块（例如脚下往外 1 格、往下 3 格、往前 3 格）原地 1 ms 返回 `out_of_reach`——"已经够得着"的判断按脚到方块角算，实际挖掘按眼睛到方块中心算，两者不一致；现在会先走过去；② `/interact` 用**玻璃瓶**对着水装水、放**睡莲 / 蛙卵**完全无效（`changed: false`）——现在和桶一样按视线判定，`/place` 也能放睡莲；③ 1.3.8 起**桶对炼药锅**会把水倒在炼药锅上面、空桶舀不出炼药锅里的水——炼药锅恢复为普通右键方块；④ 动作执行中途被 `/disconnect` 或断线时返回 `internal "Cannot read properties of null"`，现在返回 `not_connected`；⑤ `/craft` 打不开工作台时要等 20 s 才返回 `internal "Event windowOpen did not fire"`，现在 5 s 返回 `no_window` 并附坐标与距离；⑥ 背包满时 `/craft` 空转约 30 s 后报 `missing_ingredients "could not craft X: null"`（产物取不出来却当作成功，重试 64 轮），现在约 1 s 返回 `inventory_full` |

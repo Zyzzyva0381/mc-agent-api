@@ -63,6 +63,8 @@ function create (opts) {
   const sessionAgent = makeAgent(new URL(sessionServer).protocol, opts.hosts)
   return {
     name: 'yggdrasil',
+    // bot 跑在子进程里：主进程传过来的 botOptions 不带 agent（不能跨进程），在这里补回
+    prepareBotOptions (opts) { return { ...opts, agent: sessionAgent } },
     async authenticate ({ username, password }) {
       if (!password) throw new ApiError('bad_args', 'password required')
       let res

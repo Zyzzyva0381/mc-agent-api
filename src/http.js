@@ -1,8 +1,13 @@
 'use strict'
-// HTTP 层：路由、Bearer token、登录限流、动作锁与 stop_on。业务逻辑全部在 session.js。
+// HTTP 层：路由、Bearer token、登录限流。每个登录的 bot 跑在自己的子进程里（botproc.js / worker.js），
+// 这里只做认证和转发；动作锁、stop_on 等在子进程的 dispatch.js 里。
 const http = require('http')
 const crypto = require('crypto')
-const { Session, sessions, api, READONLY, ApiError, fmt, log } = require('./session')
+const { log } = require('./session')
+const { BotProcess } = require('./botproc')
+
+// token -> BotProcess
+const sessions = new Map()
 
 let config = null
 let authProvider = null
@@ -113,15 +118,14 @@ async function handleRequest (req, res) {
       const { profile, botOptions } = await authProvider.authenticate({ username, password })
       // 同一角色只能有一个 bot 在线：作废旧 session，避免新旧 bot 互踢
       for (const old of [...sessions.values()]) {
-        if (old.profile.id === profile.id) { log('REPLACE', profile.name); old.destroy() }
+        if (old.profile.id === profile.id) { log('REPLACE', profile.name); old.destroy(); sessions.delete(old.token) }
       }
       const token = crypto.randomBytes(32).toString('hex')
-      const session = new Session(token, username, profile, botOptions)
+      // 子进程启动后自动连接
+      const session = new BotProcess({ token, username, profile, botOptions, configPath: config.configPath })
       sessions.set(token, session)
       noteLoginSuccess(ip)
       log('LOGIN', username, '->', profile.name, 'from', ip)
-      // Auto-connect after login
-      session.connect()
       return send(200, { ok: true, token, expires_at: new Date(Date.now() + tokenTtlMs()).toISOString(), bot_username: profile.name })
     } catch (e) {
       // 任何失败都计入限流（invalid_credentials / 上游 too frequent / 网络错误），
@@ -139,61 +143,21 @@ async function handleRequest (req, res) {
   const session = sessions.get(token)
   if (!session) return send(401, { ok: false, error: { code: 'invalid_token', message: 'token not found or expired' } })
   if (Date.now() - session.createdAt > tokenTtlMs()) {
-    session.destroy()
+    session.destroy(); sessions.delete(token)
     return send(401, { ok: false, error: { code: 'invalid_token', message: 'token expired' } })
   }
 
   // Auth logout
   if (path === 'auth/logout') {
-    session.destroy()
+    session.destroy(); sessions.delete(token)
     return send(200, { ok: true })
   }
 
-  // API endpoints
-  const name = path.replace('/', '_') // e.g. find_blocks stays, move_to stays
-  if (!api[name]) return send(404, { ok: false, error: { code: 'unknown_api', path } })
-
-  // Action guards
-  if (!READONLY.has(name)) {
-    if (!session.isReady() && name !== 'connect') {
-      // 已在比赛服、只是登录 / 重生 / 切维度后区块和实体还没到齐：给 not_ready，别误报成 wrong_server
-      if (session.bot && session.readiness.isReady() && !session.worldReady) return send(200, { ok: false, error: { code: 'not_ready', message: 'world is still loading (after login, respawn or dimension change); retry in a moment' } })
-      return send(200, { ok: false, error: { code: 'wrong_server', message: 'bot is not ready on the target server' } })
-    }
-    if (!session.alive && name !== 'connect') return send(200, { ok: false, error: { code: 'dead', message: 'bot is dead, waiting for respawn' } })
-    if (session.busy) return send(200, { ok: false, error: { code: 'busy', message: `running ${session.busy.name}` } })
-    session.busy = { name, t: Date.now() }
-    const defaults = name === 'attack' || name === 'shoot' ? ['death'] : ['hurt', 'death']
-    session.activeStopOn = Array.isArray(args.stop_on) ? [...args.stop_on, 'death'] : defaults
-    session.interruptedBy = null
-  }
-
-  const t0 = Date.now()
-  const isAction = !READONLY.has(name)
-  try {
-    const result = await api[name](session, args)
-    if (isAction && session.interruptedBy) {
-      if (session.interruptedBy !== 'death' && result && Object.keys(result).length) result.interrupted_by = session.interruptedBy
-      else throw new ApiError(session.interruptedBy === 'death' ? 'dead' : 'interrupted', `stopped because of ${session.interruptedBy}`)
-    }
-    session.log('API', name, 'OK', Date.now() - t0 + 'ms')
-    send(200, { ok: true, ms: Date.now() - t0, result })
-  } catch (e) {
-    // 动作进行中 bot 被 /disconnect、踢出或断线：s.bot 变成 null，动作里随后的属性访问会抛 TypeError，
-    // 以前报成 internal "Cannot read properties of null (reading 'pathfinder')"
-    if (isAction && !session.bot && !e.code) e = new ApiError('not_connected', `bot disconnected while ${name} was running`)
-    if (isAction && session.bot && (!session.alive || session.bot.health <= 0)) session.interruptedBy = 'death'
-    if (isAction && session.interruptedBy && !['interrupted', 'dead'].includes(e.code)) {
-      const inner = e
-      e = new ApiError(session.interruptedBy === 'death' ? 'dead' : 'interrupted', `stopped because of ${session.interruptedBy} (${inner.message})`)
-      e.extra = { ...(inner.extra || {}), ...(inner.code ? { inner_code: inner.code } : {}) }
-    }
-    if (['interrupted', 'dead'].includes(e.code) && session.bot) e.extra = { ...(e.extra || {}), cause: session.interruptedBy, health: session.bot.health, pos: fmt(session.bot.entity.position), nearest_hostile: session.nearestHostile(24), ...(session.interruptedBy === 'death' ? { death: session.lastDeath } : {}) }
-    session.log('API', name, 'FAIL', e.code || 'internal', e.message)
-    send(200, { ok: false, ms: Date.now() - t0, error: { code: e.code || 'internal', message: e.message, ...(e.extra || {}) } })
-  } finally {
-    if (!READONLY.has(name)) { session.busy = null; session.activeStopOn = null; session.applyPosture() }
-  }
+  // API endpoints：转发给这个 token 的 bot 子进程
+  const name = path.replace('/', '_') // e.g. window/view -> window_view
+  const r = await session.call(name, args)
+  res.writeHead(r.status, { 'content-type': 'application/json' })
+  res.end(r.json)
 }
 
 // Cleanup expired sessions periodically
@@ -201,7 +165,7 @@ function sweep () {
   const now = Date.now()
   for (const [token, session] of sessions) {
     if (now - session.createdAt > tokenTtlMs()) {
-      session.destroy()
+      session.destroy(); sessions.delete(token)
       log('EXPIRED', session.username)
     }
   }

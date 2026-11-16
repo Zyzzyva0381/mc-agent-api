@@ -29,7 +29,8 @@ function rconClient (opts, baseDir) {
   let pass = opts.password || null
   if (!pass) { try { pass = fs.readFileSync(path.resolve(baseDir, opts.passwordFile || '.rcon-pass'), 'utf8').trim() } catch (e) { console.log('RCON password unavailable:', e.message) } }
   let sock = null; let buf = Buffer.alloc(0); let authed = false; let pending = null; let seq = 0
-  let players = new Map(); let pollAt = 0
+  let players = new Map(); let pollAt = 0; let polling = false; let pollStartedAt = 0
+  const wanted = new Map()   // 本进程关心的 bot 名字 -> 登记时间（has() 时登记）
   const packet = (id, type, body) => {
     const b = Buffer.from(body, 'utf8'); const p = Buffer.alloc(14 + b.length)
     p.writeInt32LE(10 + b.length, 0); p.writeInt32LE(id, 4); p.writeInt32LE(type, 8); b.copy(p, 12)
@@ -72,26 +73,50 @@ function rconClient (opts, baseDir) {
     pending = { resolve, reject, timer, command: cmd }
     if (authed && sock) sock.write(packet(++seq, 2, cmd))
   })
+  // `list` 在人多时会截断（实测只列前 13 个名字，后面是 "..."）：被截掉的 bot 会被当成"不在后端"，
+  // 反复 /server、最后整条连接重登。截断时对登记过、但不在列表里的名字逐个用 execute if entity 确认。
   const poll = async () => {
+    if (polling) return
+    polling = true
+    const started = Date.now()
     try {
-      const out = await command('list')
-      const m = /online:\s*(.*)$/.exec(out.trim())
-      const names = m && m[1] ? m[1].split(',').map(x => x.trim()).filter(Boolean) : []
+      const out = (await command('list')).trim()
+      const m = /online:\s*([\s\S]*)$/.exec(out)
+      let body = m && m[1] ? m[1].trim() : ''
+      const truncated = /(\.\.\.|…)$/.test(body)
+      if (truncated) body = body.replace(/,?\s*(\.\.\.|…)$/, '')
+      const names = body ? body.split(',').map(x => x.trim()).filter(Boolean) : []
+      if (truncated) {
+        for (const n of wanted.keys()) {
+          if (names.includes(n) || !/^[A-Za-z0-9_]{1,16}$/.test(n)) continue
+          if (/passed/i.test(await command(`execute if entity @a[name=${n},limit=1]`))) names.push(n)
+        }
+      }
       const now = Date.now()
-      players = new Map(names.map(n => [n, now])); pollAt = now
+      players = new Map(names.map(n => [n, now])); pollAt = now; pollStartedAt = started
     } catch (e) {
       if (pollAt && Date.now() - pollAt > 60000) players = new Map()
+    } finally {
+      polling = false
     }
   }
   setInterval(poll, 3000).unref()
   poll()
   rcon = {
     has (name) {
+      if (name && !wanted.has(name)) wanted.set(name, Date.now())
       if (!name || !pollAt || Date.now() - pollAt > RCON_MAX_GAP) return false
       const t = players.get(name)
       return !!t && Date.now() - t <= RCON_MAX_GAP
     },
-    fresh () { return !!pollAt && Date.now() - pollAt <= RCON_MAX_GAP }
+    // name 给出时还要求最近一次轮询是在登记这个名字之后开始的（截断时才会逐个确认它），
+    // 否则刚登录的 bot 会被第一次轮询误判为"不在后端"
+    fresh (name) {
+      if (!pollAt || Date.now() - pollAt > RCON_MAX_GAP) return false
+      if (!name) return true
+      const reg = wanted.get(name)
+      return reg !== undefined && pollStartedAt > reg
+    }
   }
   return rcon
 }
@@ -153,7 +178,7 @@ function create (s, opts, config) {
         if (!s.bot) return
         const on = backend.has(name())
         if (!onServer && on) confirm('rcon')
-        if (onServer && !on && backend.fresh()) {
+        if (onServer && !on && backend.fresh(name())) {
           s.log('GUARD RCON says not on backend, re-switching')
           onServer = false; switchRequestedAt = 0; switchAttempts = 0
           requestSwitch(1000)

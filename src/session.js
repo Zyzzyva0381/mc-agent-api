@@ -349,7 +349,8 @@ class Session {
       m.allowParkour = true
       s.bot.pathfinder.setMovements(m)
       s.bot.pathfinder.thinkTimeout = 15000
-      s.bot.pathfinder.tickTimeout = 40
+      // 每个物理 tick（50 ms）里寻路最多算 20 ms：所有 bot 同时寻路时不至于把 CPU 吃满、拖慢别的请求
+      s.bot.pathfinder.tickTimeout = 20
       s.log('SPAWN', fmt(s.bot.entity.position))
     })
     // 刚进服时区块还没下发，物理会把 bot 判成悬空而一路下坠（服务端也认），
@@ -1198,6 +1199,66 @@ function nearestBlockOf(s, names, maxDistance = 32) {
   return s.bot.findBlock({ matching: ids, maxDistance })
 }
 
+// ---------- 按 stateId 扫描半径内的方块（find_blocks 用） ----------
+// mineflayer 的 findBlocks + useExtraInfo 会为每个位置构造 Block 对象（含方块实体、生物群系），
+// 半径 64 时要几百毫秒到几秒，而且是同步的：这段时间同一个 bot 的 status 等请求全部排队。
+// 这里直接读区块里的 stateId，用预先算好的"透明 / 无碰撞箱"表判断是否露天，每 4 ms 让出一次事件循环。
+const seeThroughCache = new Map()
+function seeThroughTable(mcData) {
+  let t = seeThroughCache.get(mcData.version.minecraftVersion)
+  if (t) return t
+  let max = 0
+  for (const b of mcData.blocksArray) max = Math.max(max, b.maxStateId)
+  t = new Uint8Array(max + 1)
+  for (const b of mcData.blocksArray) if (b.boundingBox === 'empty' || b.transparent) t.fill(1, b.minStateId, b.maxStateId + 1)
+  seeThroughCache.set(mcData.version.minecraftVersion, t)
+  return t
+}
+
+// want(stateId) 为真且至少一面挨着透明 / 无碰撞箱方块的位置；返回按距离排序的前 max 个 [x, y, z, dist, stateId]
+async function scanExposed(s, radius, want, max) {
+  const bot = s.bot
+  const me = bot.entity.position
+  const see = seeThroughTable(s.mcData)
+  const minY = bot.game.minY, maxY = bot.game.minY + bot.game.height - 1
+  const cols = new Map()
+  const tmp = { x: 0, y: 0, z: 0 }
+  const sid = (x, y, z) => {
+    if (y < minY || y > maxY) return -1
+    const key = (x >> 4) * 65536 + (z >> 4)
+    let c = cols.get(key)
+    if (c === undefined) { c = bot.world.getColumn(x >> 4, z >> 4) || null; cols.set(key, c) }
+    if (!c) return -1
+    tmp.x = x & 15; tmp.y = y; tmp.z = z & 15
+    return c.getBlockStateId(tmp)
+  }
+  const open = (x, y, z) => { const v = sid(x, y, z); return v >= 0 && see[v] === 1 }
+  const out = []
+  const r = Math.ceil(radius) + 1
+  const cx = Math.floor(me.x), cy = Math.floor(me.y), cz = Math.floor(me.z)
+  let t0 = Date.now(), n = 0
+  for (let x = cx - r; x <= cx + r; x++) {
+    for (let z = cz - r; z <= cz + r; z++) {
+      const dxz = (x - me.x) ** 2 + (z - me.z) ** 2
+      if (dxz > radius * radius) continue
+      for (let y = Math.max(cy - r, minY); y <= Math.min(cy + r, maxY); y++) {
+        const d2 = dxz + (y - me.y) ** 2
+        if (d2 > radius * radius) continue
+        const v = sid(x, y, z)
+        if (v < 0 || !want(v)) continue
+        if (open(x + 1, y, z) || open(x - 1, y, z) || open(x, y + 1, z) || open(x, y - 1, z) || open(x, y, z + 1) || open(x, y, z - 1)) out.push([x, y, z, Math.sqrt(d2), v])
+      }
+      if (++n % 64 === 0 && Date.now() - t0 > 4) {
+        await new Promise(res => setImmediate(res))
+        if (s.bot !== bot || !bot.entity) fail('not_connected', 'bot disconnected during find_blocks')
+        t0 = Date.now()
+      }
+    }
+  }
+  out.sort((a, b) => a[3] - b[3])
+  return out.slice(0, max)
+}
+
 function isExposed(s, p) {
   if (p && p.position) p = p.position
   return [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]].some(d => {
@@ -1861,10 +1922,13 @@ const api = {
       const ids = types.map(n => { const b = s.mcData.blocksByName[n]; if (!b) fail('bad_args', `unknown block ${n}`); return b.id })
       if (properties) checkPropFilter(s, types, properties)
       if (mature !== undefined && !types.some(n => CROP_AGE_PROP[n])) fail('bad_args', `mature filter only applies to crops: ${Object.keys(CROP_AGE_PROP).join(', ')}`)
+      const idSet = new Set(ids)
+      const stateBlock = s.mcData.blocksByStateId
       const found = []
-      for (const p of s.bot.findBlocks({ matching: ids, maxDistance: radius, count: 10000 })) {
-        if (!isExposed(s, p)) continue
+      for (const [x, y, z] of await scanExposed(s, radius, v => { const b = stateBlock[v]; return !!b && idSet.has(b.id) }, 10000)) {
+        const p = new Vec3(x, y, z)
         const b = s.bot.blockAt(p)
+        if (!b) continue
         const props = blockProps(b)
         if (properties && Object.entries(properties).some(([k, v]) => String(props[k]) !== String(v))) continue
         const crop = cropInfo(s, b, props)
@@ -1874,11 +1938,12 @@ const api = {
       found.sort((a, b) => a.dist - b.dist)
       return { total: found.length, blocks: found.slice(0, limit) }
     }
-    const pts = s.bot.findBlocks({ matching: b => b && !skip.has(b.name), useExtraInfo: p => isExposed(s, p), maxDistance: radius, count: 4000 })
+    const stateBlock = s.mcData.blocksByStateId
+    const pts = await scanExposed(s, radius, v => { const b = stateBlock[v]; return !!b && !skip.has(b.name) }, 4000)
     const summary = {}
-    for (const p of pts) {
-      const n = s.bot.blockAt(p).name
-      const d = p.distanceTo(me)
+    for (const [x, y, z, d, v] of pts) {
+      const n = stateBlock[v].name
+      const p = { x, y, z }
       const rec = summary[n] || (summary[n] = { count: 0, nearest: null, dist: 1e9 })
       rec.count++
       if (d < rec.dist) { rec.dist = +d.toFixed(1); rec.nearest = [p.x, p.y, p.z] }

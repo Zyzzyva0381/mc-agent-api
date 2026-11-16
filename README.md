@@ -70,6 +70,10 @@ curl -s -X POST http://127.0.0.1:18900/api/v1/move_to \
 
 完整示例见 [examples/config.yggdrasil-proxy.json](examples/config.yggdrasil-proxy.json)。
 
+## 资源与进程
+
+每个登录的 bot 跑在自己的 Node 子进程里，HTTP 主进程只负责认证和转发：一个 bot 在寻路或大范围 `find_blocks` 时不会拖慢其它 bot 的请求，多核也能用上。代价是内存：每个 bot 约 220 MB（23 个 bot 实测共约 5.1 GB），按同时在线的 bot 数准备内存。子进程意外退出会自动重启（10 分钟内最多 5 次），主进程退出时子进程跟着退出。
+
 ## 安全提示
 
 - API 本身是明文 HTTP。对公网开放时请放在 HTTPS 反向代理后面，并打开 `http.trustProxyHeaders`。

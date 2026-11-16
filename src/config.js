@@ -36,6 +36,7 @@ function loadConfig (file) {
   }
   const cfg = merge(DEFAULTS, user)
   cfg.baseDir = path.dirname(p)
+  cfg.configPath = p
   if (process.env.MC_AGENT_PORT) cfg.http.port = Number(process.env.MC_AGENT_PORT)
   return cfg
 }

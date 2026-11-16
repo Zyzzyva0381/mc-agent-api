@@ -2,6 +2,8 @@
 
 核心引擎（`src/session.js`、`src/http.js`）不关心"账号从哪来"和"bot 什么时候算到位了"，这两件事交给两类适配器。内置的够用就只改配置；不够用就写一个 JS 文件，用 `module` 指过去（相对 `config.json` 所在目录）。
 
+**进程模型**（1.3.13 起）：HTTP 主进程只做认证和转发，每个登录的 bot 跑在自己的子进程里（`src/worker.js`），这样一个 bot 的重计算（寻路、大范围 `find_blocks`）不会拖慢其它 bot 的请求。所以：认证适配器的 `authenticate` 在主进程里执行，返回的 `botOptions` 要通过 IPC 传给子进程；就绪判定适配器在子进程里创建，每个 bot 一份（模块级的单例也是每个子进程一份）。
+
 ## 认证适配器（`auth`）
 
 ```json
@@ -21,7 +23,10 @@ exports.create = (authConfig, config) => ({
       // 原样展开进 mineflayer.createBot()
       botOptions: { username: '角色名', auth: 'offline' }
     }
-  }
+  },
+  // 可选：botOptions 会经 IPC（结构化克隆）传到 bot 子进程，函数、HTTP agent 之类传不过去。
+  // 主进程会去掉 botOptions.agent；需要的话在这里（子进程里）补回来
+  prepareBotOptions (botOptions) { return botOptions }
 })
 ```
 
