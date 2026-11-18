@@ -5,6 +5,7 @@
   "main": "src/index.js",
   "bin": { "mc-agent-api": "src/index.js" },
   "scripts": {
+    "test": "node --test test/*.test.js",
     "start": "node src/index.js config.json",
     "check": "node -e \"for (const f of require('fs').readdirSync('src', { recursive: true })) if (f.endsWith('.js')) require('child_process').execFileSync(process.execPath, ['--check', 'src/' + f])\""
   },

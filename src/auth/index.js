@@ -1,8 +1,9 @@
 'use strict'
 // 认证适配器。接口：
 //
-//   { name, authenticate({ username, password }) -> Promise<{ profile: { id, name }, botOptions }> }
+//   { name, authenticate({ username, password, profile }) -> Promise<{ profile: { id, name }, botOptions }> }
 //
+// - profile 为可选角色名或 UUID；offline 忽略此字段，仍使用 username；
 // - profile.id 用来保证"同一角色只有一个 bot 在线"（新登录会顶掉旧 session）；
 // - botOptions 原样展开进 mineflayer.createBot()（username / auth / session / sessionServer / agent ...）；
 // - 失败时抛 ApiError：invalid_credentials / rate_limited / no_profile / auth_error。

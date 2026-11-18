@@ -112,10 +112,13 @@ async function handleRequest (req, res) {
       res.writeHead(429, { 'content-type': 'application/json', 'retry-after': String(rl.retry) })
       return res.end(JSON.stringify({ ok: false, error: { code: 'rate_limited', message: `too many login attempts, retry in ${rl.retry}s`, retry_after_s: rl.retry } }))
     }
-    const { username, password } = args
+    const { username, password, profile: requestedProfile } = args
     if (!username || typeof username !== 'string') return send(400, { ok: false, error: { code: 'bad_args', message: 'username required' } })
+    if (requestedProfile !== undefined && (typeof requestedProfile !== 'string' || !requestedProfile.trim())) {
+      return send(400, { ok: false, error: { code: 'bad_args', message: 'profile must be a non-empty string' } })
+    }
     try {
-      const { profile, botOptions } = await authProvider.authenticate({ username, password })
+      const { profile, botOptions } = await authProvider.authenticate({ username, password, profile: requestedProfile })
       // 同一角色只能有一个 bot 在线：作废旧 session，避免新旧 bot 互踢
       for (const old of [...sessions.values()]) {
         if (old.profile.id === profile.id) { log('REPLACE', profile.name); old.destroy(); sessions.delete(old.token) }
