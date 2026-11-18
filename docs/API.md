@@ -70,6 +70,16 @@ POST /auth/login
 { "username": "用户名", "password": "密码" }
 ```
 
+可选字段 `"profile"` 指定角色名或 UUID（支持带连字符或不带连字符的 UUID）。若提供，必须为非空字符串，否则返回 HTTP 400 / `bad_args`。
+
+```json
+{ "username": "皮肤站账号", "password": "密码", "profile": "Agent_2" }
+```
+
+`yggdrasil` 按角色名（区分大小写）或 UUID 选择账号下的角色。当前已选中目标时直接使用认证结果；否则调用认证服务器 `/refresh`，将令牌绑定到目标角色。目标不属于该账号时返回 `no_profile`。省略 `profile` 时使用服务端选定角色；未选定但只有一个可用角色时使用该角色，否则返回 `no_profile`。同账号下不同角色可同时登录，各自获得独立 token；同一角色重复登录仍会使旧 token 失效。
+
+`offline` 适配器忽略通过入口校验的 `profile`，始终使用 `username` 生成角色和离线 UUID。自定义适配器自行实现选角逻辑。
+
 **Response 200**
 
 ```json
@@ -84,7 +94,8 @@ POST /auth/login
 | HTTP | `error.code` | 说明 |
 |---|---|---|
 | 401 | `invalid_credentials` | 用户名或密码错误 |
-| 401 | `no_profile` | 外置登录（yggdrasil）账号下没有选定角色 |
+| 400 | `bad_args` | 缺少用户名，或 `profile` 不是非空字符串 |
+| 401 | `no_profile` | 外置登录（yggdrasil）没有可确定的角色，或指定角色不属于该账号 |
 | 429 | `rate_limited` | 上游认证服务限频（`retry_after_s` 为空，等几秒重试） |
 | 429 | `rate_limited` | **本服务限流**：同一 IP 每分钟最多 10 次失败，超过锁 60 秒；全局每分钟最多 60 次尝试（均可在 `http.loginRateLimit` 配置）。带 `retry_after_s` 与 `Retry-After` 响应头 |
 

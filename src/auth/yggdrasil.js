@@ -11,6 +11,7 @@
 const http = require('http')
 const https = require('https')
 const dns = require('dns')
+const crypto = require('crypto')
 const { ApiError } = require('../session')
 
 function makeAgent (proto, hosts) {
@@ -65,31 +66,57 @@ function create (opts) {
     name: 'yggdrasil',
     // bot 跑在子进程里：主进程传过来的 botOptions 不带 agent（不能跨进程），在这里补回
     prepareBotOptions (opts) { return { ...opts, agent: sessionAgent } },
-    async authenticate ({ username, password }) {
+    async authenticate ({ username, password, profile: requestedProfile }) {
       if (!password) throw new ApiError('bad_args', 'password required')
-      let res
-      try {
-        res = await postJson(authBase + '/authenticate', {
-          agent: { name: 'Minecraft', version: 1 }, username, password, requestUser: true
-        }, authAgent)
-      } catch (e) {
-        throw new ApiError('auth_error', e.message)
+      const clientToken = crypto.randomUUID()
+      async function request (endpoint, body) {
+        let res
+        try {
+          res = await postJson(authBase + endpoint, body, authAgent)
+        } catch (e) {
+          throw new ApiError('auth_error', e.message)
+        }
+        let r
+        try { r = JSON.parse(res.text) } catch (e) { throw new ApiError('auth_error', 'failed to parse auth response') }
+        if (!r || typeof r !== 'object' || Array.isArray(r)) throw new ApiError('auth_error', 'invalid auth response')
+        if (res.status !== 200 || r.error) {
+          const msg = r.errorMessage || 'authentication failed'
+          throw new ApiError(/too frequent|too many/i.test(msg) ? 'rate_limited' : 'invalid_credentials', msg)
+        }
+        if (!r.accessToken || (r.clientToken !== undefined && r.clientToken !== clientToken)) {
+          throw new ApiError('auth_error', 'invalid token in auth response')
+        }
+        return r
       }
-      let r
-      try { r = JSON.parse(res.text) } catch (e) { throw new ApiError('auth_error', 'failed to parse auth response') }
-      if (res.status !== 200 || r.error) {
-        const msg = r.errorMessage || 'authentication failed'
-        throw new ApiError(/too frequent|too many/i.test(msg) ? 'rate_limited' : 'invalid_credentials', msg)
+      let r = await request('/authenticate', {
+        agent: { name: 'Minecraft', version: 1 }, username, password, clientToken, requestUser: true
+      })
+      const available = Array.isArray(r.availableProfiles) ? r.availableProfiles : []
+      const matches = p => p && (p.name === requestedProfile ||
+        (typeof p.id === 'string' && p.id.replace(/-/g, '').toLowerCase() === requestedProfile.replace(/-/g, '').toLowerCase()))
+      if (requestedProfile !== undefined && !matches(r.selectedProfile)) {
+        const target = available.find(matches)
+        if (!target) throw new ApiError('no_profile', 'requested character is not available on this account')
+        // Token 必须在认证服务器上绑定角色，不能只替换本地 selectedProfile。
+        r = await request('/refresh', {
+          accessToken: r.accessToken,
+          clientToken,
+          selectedProfile: { id: target.id, name: target.name },
+          requestUser: true
+        })
+        if (!r.selectedProfile || r.selectedProfile.id !== target.id || r.selectedProfile.name !== target.name) {
+          throw new ApiError('auth_error', 'refresh did not select the requested character')
+        }
       }
-      if (!r.selectedProfile) throw new ApiError('no_profile', 'account has no selected character')
-      const profile = r.selectedProfile
+      const profile = r.selectedProfile || (requestedProfile === undefined && available.length === 1 ? available[0] : null)
+      if (!profile) throw new ApiError('no_profile', 'account has no selected character; specify profile to choose one')
       return {
         profile,
         botOptions: {
           username: profile.name,
           auth: 'mojang',
           skipValidation: true,
-          session: { accessToken: r.accessToken, selectedProfile: profile },
+          session: { accessToken: r.accessToken, clientToken: r.clientToken || clientToken, selectedProfile: profile },
           sessionServer,
           agent: sessionAgent
         }
