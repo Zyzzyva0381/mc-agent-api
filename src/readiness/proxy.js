@@ -8,6 +8,14 @@
 //     "rcon": { "host": "10.0.0.6", "port": 25575, "passwordFile": ".rcon-pass" }   // 可选，见下
 //   }
 //
+// 多个后端（每个玩家固定去自己那台）：
+//     "backends": {                    // 可选：每个后端自己的 RCON（没列出的后端不做 RCON 确认）
+//       "survival2": { "rcon": { "host": "10.0.0.6", "port": 25576, "passwordFile": ".rcon-pass" } }
+//     },
+//     "assignments": { "Alice": "survival2" },           // 可选：玩家名（不分大小写）-> 后端名
+//     "assignmentsFile": "assignments.json"              // 可选：同样格式的 JSON 文件，每次登录时重新读
+//   没分配的玩家去 "server"。分配在登录时决定（每个登录一个 bot 进程），改了文件要重新登录才生效。
+//
 // 确认信号：
 //  - advancement 集合规模：大厅只下发很小的自定义集合，后端下发完整原版树。注意后端可能分几次下发
 //    （先 2 条 root，几十秒后才补全），所以单靠它会出现"明明在后端、ready 却一直 false"；
@@ -23,9 +31,11 @@ const RCON_MAX_GAP = 12000
 // ---------- 后端在场确认（RCON，进程级单例） ----------
 // ready 不能只看 advancement 定义数：后端会把 advancement 树分几次下发
 // （先 2 条 root，几十秒后才补 41 条），RCON 的玩家列表才是权威信号。
-let rcon = null
+const rcons = new Map()   // host:port -> client
 function rconClient (opts, baseDir) {
-  if (rcon) return rcon
+  const key = (opts.host || '127.0.0.1') + ':' + (opts.port || 25575)
+  if (rcons.has(key)) return rcons.get(key)
+  let rcon = null
   let pass = opts.password || null
   if (!pass) { try { pass = fs.readFileSync(path.resolve(baseDir, opts.passwordFile || '.rcon-pass'), 'utf8').trim() } catch (e) { console.log('RCON password unavailable:', e.message) } }
   let sock = null; let buf = Buffer.alloc(0); let authed = false; let pending = null; let seq = 0
@@ -118,14 +128,32 @@ function rconClient (opts, baseDir) {
       return reg !== undefined && pollStartedAt > reg
     }
   }
+  rcons.set(key, rcon)
   return rcon
+}
+
+// 玩家名 -> 后端名：assignmentsFile 优先于内联 assignments，名字不分大小写
+function assignedServer (opts, config, username) {
+  const table = {}
+  const add = obj => { for (const [k, v] of Object.entries(obj || {})) if (typeof v === 'string' && v) table[k.toLowerCase()] = v }
+  add(opts.assignments)
+  if (opts.assignmentsFile) {
+    try { add(JSON.parse(fs.readFileSync(path.resolve(config.baseDir, opts.assignmentsFile), 'utf8'))) } catch (e) { console.log('readiness.proxy: cannot read assignmentsFile:', e.message) }
+  }
+  return (username && table[String(username).toLowerCase()]) || opts.server
 }
 
 function create (s, opts, config) {
   if (!opts.server) throw new Error('readiness.proxy needs "server" (the backend name used with /server)')
-  const server = opts.server
+  const server = assignedServer(opts, config, s.username)
   const minAdv = opts.minAdvancements || 20
-  const backend = opts.rcon ? rconClient(opts.rcon, config.baseDir) : { has: () => false, fresh: () => false }
+  const bcfg = (opts.backends && opts.backends[server]) || {}
+  const rconOpts = bcfg.rcon || (server === opts.server ? opts.rcon : null)
+  const backend = rconOpts ? rconClient(rconOpts, config.baseDir) : { has: () => false, fresh: () => false }
+  if (server !== opts.server) s.log('GUARD assigned backend ' + server)
+  // 多个后端时 advancement 规模分不出是哪一台（每台都下发完整原版树），代理也可能直接把人放到默认后端：
+  // 这时只认那台后端的 RCON 玩家列表，advancement 只用来识别"被踢回大厅"
+  const rconOnly = !!(opts.backends && Object.keys(opts.backends).length && rconOpts)
   let onServer = false
   let switchRequestedAt = 0
   let switchAttempts = 0
@@ -196,7 +224,11 @@ function create (s, opts, config) {
     // 大厅只下发很小的自定义 advancement 集合，后端下发完整原版树：这是唯一可靠的服务器身份信号
     onAdvancements (p) {
       const size = s.advancementDefinitions.size
-      if (size >= minAdv) return confirm('advancements')
+      if (size >= minAdv) {
+        if (!rconOnly) return confirm('advancements')
+        if (backend.has(name())) return confirm('rcon')
+        return
+      }
       if (p.reset && size <= 5) {
         if (backend.has(name())) { s.log('GUARD small advancement reset ignored, RCON says on backend'); return }
         const was = onServer
@@ -213,6 +245,8 @@ function create (s, opts, config) {
       onServer = false; switchRequestedAt = 0; switchAttempts = 0
       if (guardTimer) { clearInterval(guardTimer); guardTimer = null }
     },
+    // 这个 bot 要去的后端（status.server）
+    server,
     destroy () {
       if (switchTimer) { clearTimeout(switchTimer); switchTimer = null }
       if (guardTimer) { clearInterval(guardTimer); guardTimer = null }

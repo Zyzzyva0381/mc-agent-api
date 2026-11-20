@@ -8,6 +8,7 @@ const { BotProcess } = require('./botproc')
 
 // token -> BotProcess
 const sessions = new Map()
+const MAX_BODY_BYTES = 1024 * 1024
 
 let config = null
 let authProvider = null
@@ -16,10 +17,6 @@ const tokenTtlMs = () => config.session.tokenTtlHours * 60 * 60 * 1000
 function configure (opts) {
   config = opts.config
   authProvider = opts.authProvider
-  const rl = config.http.loginRateLimit || {}
-  if (rl.maxFailsPerIp) LOGIN_MAX_FAILS_PER_IP = rl.maxFailsPerIp
-  if (rl.blockSeconds) LOGIN_BLOCK_MS = rl.blockSeconds * 1000
-  if (rl.maxGlobalPerMinute) LOGIN_MAX_GLOBAL_PER_MIN = rl.maxGlobalPerMinute
 }
 
 // ---------- /auth/login 限流 ----------
@@ -27,9 +24,6 @@ function configure (opts) {
 // 免得把上游认证服务（皮肤站等）打爆。部署在反向代理 / 隧道后面时，打开
 // http.trustProxyHeaders，按 CF-Connecting-IP / X-Forwarded-For 区分客户端。
 const LOGIN_WINDOW_MS = 60 * 1000
-let LOGIN_MAX_FAILS_PER_IP = 10
-let LOGIN_BLOCK_MS = 60 * 1000
-let LOGIN_MAX_GLOBAL_PER_MIN = 60
 const loginFails = new Map() // ip -> { count, windowStart }
 const loginBlocked = new Map() // ip -> until(ms)
 let loginAttempts = [] // 全局滑动窗口
@@ -50,7 +44,7 @@ function loginRateState (ip) {
   if (until && until > now) return { blocked: true, retry: Math.ceil((until - now) / 1000), reason: 'ip' }
   if (until && until <= now) loginBlocked.delete(ip)
   loginAttempts = loginAttempts.filter(t => now - t < LOGIN_WINDOW_MS)
-  if (loginAttempts.length >= LOGIN_MAX_GLOBAL_PER_MIN) {
+  if (loginAttempts.length >= config.http.loginRateLimit.maxGlobalPerMinute) {
     return { blocked: true, retry: 30, reason: 'global' }
   }
   loginAttempts.push(now)
@@ -60,14 +54,14 @@ function loginRateState (ip) {
 function noteLoginFailure (ip) {
   const now = Date.now()
   const rec = loginFails.get(ip)
-  if (!rec || now - rec.windowStart > LOGIN_WINDOW_MS) {
-    loginFails.set(ip, { count: 1, windowStart: now })
-    return
-  }
-  rec.count++
-  if (rec.count >= LOGIN_MAX_FAILS_PER_IP) {
-    loginBlocked.set(ip, now + LOGIN_BLOCK_MS)
+  const active = rec && now - rec.windowStart <= LOGIN_WINDOW_MS
+  const count = active ? rec.count + 1 : 1
+  const { maxFailsPerIp, blockSeconds } = config.http.loginRateLimit
+  if (count >= maxFailsPerIp) {
+    loginBlocked.set(ip, now + blockSeconds * 1000)
     loginFails.delete(ip)
+  } else {
+    loginFails.set(ip, { count, windowStart: active ? rec.windowStart : now })
   }
 }
 
@@ -85,9 +79,25 @@ async function handleRequest (req, res) {
   if (!match) return send(404, { ok: false, error: { code: 'not_found' } })
   const path = match[1]
 
-  // Read body
-  let body = ''
-  for await (const c of req) body += c
+  const rejectOversizedBody = () => {
+    res.setHeader('Connection', 'close')
+    send(413, { ok: false, error: { code: 'body_too_large', message: 'request body exceeds 1 MiB' } })
+  }
+  if (Number(req.headers['content-length']) > MAX_BODY_BYTES) return rejectOversizedBody()
+  const chunks = []
+  let bytes = 0
+  try {
+    // Leave the socket open long enough to send the 413 response on an early return.
+    for await (const chunk of req.iterator({ destroyOnReturn: false })) {
+      bytes += chunk.length
+      if (bytes > MAX_BODY_BYTES) return rejectOversizedBody()
+      chunks.push(chunk)
+    }
+  } catch (error) {
+    if (req.aborted || res.destroyed) return
+    return send(400, { ok: false, error: { code: 'bad_json' } })
+  }
+  const body = Buffer.concat(chunks, bytes).toString('utf8')
   let args = {}
   try { args = body ? JSON.parse(body) : {} } catch { return send(400, { ok: false, error: { code: 'bad_json' } }) }
   // 查询串：文档里 /events 写的是 GET ?since=&limit=，之前只读 body 导致参数被静默忽略。

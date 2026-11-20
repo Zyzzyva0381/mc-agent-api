@@ -38,6 +38,7 @@
 | 400 | 请求体不是合法 JSON |
 | 401 | 缺少 / 无效 / 过期的 Bearer Token |
 | 404 | 路径不存在（`error.code` 为 `unknown_api`） |
+| 413 | 请求体超过 1 MiB（`error.code` 为 `body_too_large`） |
 
 `ms` 是本次调用在服务端的耗时（毫秒）。`error` 里除了 `code`、`message` 还会带上下文（如 `inventory`、`pos`、`required`），便于 agent 直接纠错。
 
@@ -115,13 +116,15 @@ POST /connect
 
 `result`：`{"ok": true}`；已在线时 `{"ok": true, "already_connected": true}`。断线重连需间隔 ≥ 30 秒，死亡循环冷却期间返回 `death_loop_cooldown`（附 `cooldown_remaining_seconds`）。
 
-`status.ready` 表示 bot 已在目标服务器上、可以执行动作，由部署方配置的**就绪适配器**判定：直连单个服务器（默认 `direct`）时出生即就绪；挂在 Velocity / BungeeCord 等代理后面时，适配器负责把 bot 从大厅切到后端并确认（见 `docs/ADAPTERS.md`）。`ready=false` 时动作接口返回 `wrong_server`。如果已经连着但 `ready` 仍为 `false`，`/connect` 会把机会交给适配器补救（例如重发切服命令），返回：
+`status.ready` 由部署方配置的就绪适配器和世界加载状态共同决定。代理模式下，`status.server` 显示分配的目标后端。等 `ready: true` 再读取坐标、背包和方块数据，因为切服期间这些数据可能来自中转服务器。代理模式的登录名和分配表见 `docs/ADAPTERS.md`。
+
+已经连着但尚未就绪时，`/connect` 会请求适配器重试，实际发送受重试间隔限制。接口可能返回：
 
 ```json
 {"ok": true, "already_connected": true, "ready": false}
 ```
 
-适配器可能附带额外字段。等待几秒后重新 `GET /status`，`ready` 变 `true` 就可以正常调用动作接口。
+适配器可能附带额外字段。切服等待期间，挖掘等动作可能返回 `wrong_server`；在目标服务器上等待世界加载时，可能返回 `not_ready`。目标不可用或后端确认故障持续时，重试可能一直无法就绪。
 
 ### 2.2 断开
 
@@ -183,6 +186,7 @@ GET /status
     "on_ground": true,
     "alive": true,
     "ready": true,
+    "server": "survival2",
     "busy": null,
     "nearest_hostile": {"id": 812, "name": "zombie", "dist": 12.5},
     "last_death": {"pos": [80, 63, -180], "t": 1791881333488, "cause": "Agent_1 was slain by Zombie"}
@@ -192,7 +196,7 @@ GET /status
 
 | 字段 | 说明 |
 |---|---|
-| `ready` | **可以调用动作接口了**：就绪适配器确认已在目标服务器且存活，且周围区块和实体已经到齐（进服后约 2–3 秒；之前 `get_entities` 可能是空的）。死亡重生、切换维度后同样会先变 `false`、等新世界到齐再变回 `true`（约 2–4 秒），这期间动作接口返回 `not_ready` |
+| `ready` | API 的连接就绪状态。通常在确认目标后端并等待区块和实体加载后置为 `true`。死亡重生或切换维度会重新等待世界加载。执行动作前也要检查 `alive` |
 | `busy` | 正在执行的动作名，空闲为 `null` |
 | `speed` | 当前水平速度（格/秒，3 位小数），按 bot **上一个物理 tick 的实际位移**算。参考：步行约 4.3、疾跑约 5.6、站着 0；为 `null` 的情况同 `velocity` |
 | `velocity` | 上一个物理 tick 的实际位移 `[vx, vy, vz]` × 20（格/秒），Y 正值向上；下落、被击退、被水流冲时都会体现。刚传送 / 上下载具后的第一个 tick、骑乘中、还没有物理数据时为 `null` |
@@ -207,6 +211,7 @@ GET /status
 | `in_vehicle` | `{"id","name"}` 或 `null` |
 | `sneaking` / `jumping` / `blocking` | 当前姿态，与 `/posture` 对应（`jumping` 为持续按住跳跃，水里即踩水浮面） |
 | `held_controls` | `/control` `wait:false` 正在按住的键：`{"keys": ["forward"], "release_in_ms": 120}`；没有时为 `null` |
+| `server` | 代理就绪适配器为会话选定的目标后端名（`/server` 后面那个名字）。切服期间这个字段仍显示目标；各后端分别保存世界、背包和进度 |
 | `using_item` | 正在使用物品时返回 `{"name","elapsed_ms"}` |
 | `nearest_hostile` | 24 格内最近的敌对生物，没有则省略 |
 | `last_death` | 最近一次死亡的位置、时间、死亡信息 |
@@ -948,6 +953,7 @@ curl -s -X POST http://127.0.0.1:18900/api/v1/posture \
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 1.3.15 | 2026-11-20 | 支持按角色分配代理后端，`/status.server` 显示目标；修复 Velocity 切服后世界就绪状态未恢复，以及断线时动作报错；限制 HTTP 请求体为 1 MiB |
 | 1.3.14 | 2026-11-16 | 新增 `/control` `"wait": false`（实时操控）：按下就返回（服务端约 1 ms，以前要等满 `ms`），键在后台按住 `ms` 后松开，下一个 `/control` 立刻接管；`{"wait": false}` 空调用立即松开；`/status` 新增 `held_controls` |
 | 1.3.13 | 2026-11-16 | 23 个 bot 压测后的修复：① **每个 bot 一个进程**——以前所有 bot 共用一个 Node 线程，任何一个 bot 寻路或大范围 `find_blocks` 都会拖慢所有人，23 个 bot 同时干活时 `status` p99 4.5 s、`control` p99 4 s；现在同样负载下 `status` p99 3 ms、`control`（ms=100）p99 106 ms，全部 bot 满负荷重计算时 `status` p99 约 50 ms；② 后端在线人数超过 13 时，服务器 RCON `list` 只列前 13 个名字，之后的 bot 会被误判为"不在后端"而反复 `/server`、断线重登（在线人数在 20–23 之间跳）——现在被截断时逐个确认；③ `find_blocks` 改为直接按方块状态扫描并分段让出：半径 64 从约 0.4–3.6 s 降到约 0.1 s；以前的实现按区块"八面体"遍历，会漏掉对角方向、但仍在半径内的方块，现在结果更完整（数量会比以前多）；④ 重连途中调用 `get_block` / `find_blocks` / `get_entities` / `inventory` 返回 `not_ready`，以前是 `internal`；⑤ 寻路每个 tick 最多计算 20 ms（以前 40 ms） |
 | 1.3.12 | 2026-11-15 | 延迟：① 服务监听 `127.0.0.1` 或 `0.0.0.0` 时额外监听 `[::1]`——以前 Windows 客户端用 `http://localhost:...` 时每个新连接先在 IPv6 上白等（实测 Python 2 s、Node 20+ fetch 约 0.25 s）；② `/posture` 固定等待 150 ms → 55 ms（一个 tick），服务器端实测每次都已看到潜行状态 |

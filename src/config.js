@@ -35,6 +35,13 @@ function loadConfig (file) {
     throw new Error('config file not found: ' + p)
   }
   const cfg = merge(DEFAULTS, user)
+  const rateLimit = cfg.http.loginRateLimit ?? DEFAULTS.http.loginRateLimit
+  for (const key of Object.keys(DEFAULTS.http.loginRateLimit)) {
+    if (!Number.isSafeInteger(rateLimit[key]) || rateLimit[key] < 1) {
+      throw new Error(`http.loginRateLimit.${key} must be a positive integer`)
+    }
+  }
+  cfg.http.loginRateLimit = rateLimit
   cfg.baseDir = path.dirname(p)
   cfg.configPath = p
   if (process.env.MC_AGENT_PORT) cfg.http.port = Number(process.env.MC_AGENT_PORT)

@@ -78,3 +78,21 @@ exports.create = (session, opts) => {
 ```
 
 内置 `proxy` 适配器（`src/readiness/proxy.js`）是一个完整的参考实现：自动 `/server`、用 advancement 规模识别大厅 / 后端、用后端 RCON 做在场确认、切服失败时整条连接自愈。
+
+比赛服拆成多台后端时（每台一个服务端进程，主线程互不影响），给 `proxy` 加分配表，每个账号固定去一台：
+
+```json
+"readiness": {
+  "type": "proxy",
+  "server": "survival",
+  "rcon": { "host": "10.0.0.6", "port": 25575, "passwordFile": ".rcon-pass" },
+  "backends": { "survival2": { "rcon": { "host": "10.0.0.6", "port": 25576, "passwordFile": ".rcon-pass" } } },
+  "assignmentsFile": "assignments.json"
+}
+```
+
+`assignments.json` 是 `{"登录名": "后端名"}`。匹配不区分大小写。外置认证允许用不同标识登录同一角色时，分配表匹配的是请求中的 `username`。赛事部署应统一使用登记的角色名登录。
+
+分配表在 bot 子进程启动时读取，文件条目覆盖内联的 `assignments`。没有匹配条目时使用 `server`。修改分配表后，新会话会使用新值。现有会话在原子进程内重连会保持原分配，子进程异常重启时会重新读取，即使客户端还在使用原 token。
+
+在 Velocity 注册分配表里的每个后端，并给每个后端配置自己的 RCON。多服模式用目标后端的玩家列表确认 bot 在场。部署时应校验分配 JSON、后端名及 RCON 地址，再原子替换分配文件。适配器的 `server` 字段出现在 `/status.server`，表示目标后端。

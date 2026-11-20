@@ -52,7 +52,7 @@ async function dispatch (session, name, args) {
       e = new ApiError(session.interruptedBy === 'death' ? 'dead' : 'interrupted', `stopped because of ${session.interruptedBy} (${inner.message})`)
       e.extra = { ...(inner.extra || {}), ...(inner.code ? { inner_code: inner.code } : {}) }
     }
-    if (['interrupted', 'dead'].includes(e.code) && session.bot) e.extra = { ...(e.extra || {}), cause: session.interruptedBy, health: session.bot.health, pos: fmt(session.bot.entity.position), nearest_hostile: session.nearestHostile(24), ...(session.interruptedBy === 'death' ? { death: session.lastDeath } : {}) }
+    if (['interrupted', 'dead'].includes(e.code) && session.bot?.entity) e.extra = { ...(e.extra || {}), cause: session.interruptedBy, health: session.bot.health, pos: fmt(session.bot.entity.position), nearest_hostile: session.nearestHostile(24), ...(session.interruptedBy === 'death' ? { death: session.lastDeath } : {}) }
     session.log('API', name, 'FAIL', e.code || 'internal', e.message)
     return { status: 200, body: { ok: false, ms: Date.now() - t0, error: { code: e.code || 'internal', message: e.message, ...(e.extra || {}) } } }
   } finally {

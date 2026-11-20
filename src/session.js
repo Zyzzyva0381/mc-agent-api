@@ -23,6 +23,10 @@ class ApiError extends Error {
   constructor(code, message, extra) { super(message); this.code = code; this.extra = extra }
 }
 const fail = (code, msg, extra) => { throw new ApiError(code, msg, extra) }
+function requireConnected(s, bot = s.bot) {
+  if (s.bot !== bot || !bot?.entity) fail('not_connected', 'bot is no longer connected')
+  return bot
+}
 
 class Session {
   constructor(token, username, profile, botOptions) {
@@ -105,7 +109,7 @@ class Session {
   }
 
   nearestHostile(radius) {
-    if (!this.bot) return null
+    if (!this.bot?.entity) return null
     const me = this.bot.entity.position
     const h = Object.values(this.bot.entities).filter(e => e.type === 'hostile' && e.position.distanceTo(me) <= radius)
       .sort((a, b) => a.position.distanceTo(me) - b.position.distanceTo(me))[0]
@@ -178,10 +182,10 @@ class Session {
     } catch (e) {
       s.log('packet table unavailable, outbound name guard disabled:', e.message)
     }
-    const clientWrite = s.bot._client.write.bind(s.bot._client)
-    s.bot._client.write = (name, params) => {
-      const client = s.bot._client
-      if (client.state === 'play' && !playOutPackets.has(name)) {
+    const client = s.bot._client
+    const clientWrite = client.write.bind(client)
+    client.write = (name, params) => {
+      if (client.state === 'play' && playOutPackets.size > 0 && !playOutPackets.has(name)) {
         s.log('SKIP unknown outbound packet ' + name + ' (not in ' + (s.bot && s.bot.version) + ' play.toServer)')
         return false
       }
@@ -385,19 +389,33 @@ class Session {
     s.bot.on('entitySpawn', () => { s.lastEntitySpawnAt = Date.now() })
     // 死亡重生、切维度走的是 respawn 包（不是 login），之前 ready 一直是 true，
     // 换完世界后约 0.25 s 内 get_block 会 not_loaded、get_entities 为空
-    for (const ev of ['login', 'respawn']) s.bot.on(ev, () => { s.worldReady = false; s.worldGen++ })
-    s.bot.on('spawn', async () => {
-      if (s.worldReady) return
-      const bot = s.bot
+    const worldBot = s.bot
+    let hasSpawned = false
+    let waitingGen = -1
+    for (const ev of ['login', 'respawn']) worldBot.on(ev, () => { s.worldReady = false; s.worldGen++ })
+    const waitForWorld = async () => {
+      if (s.bot !== worldBot || s.worldReady || waitingGen === s.worldGen) return
       const gen = s.worldGen
+      waitingGen = gen
       const t0 = Date.now()
-      try { await withTimeout(bot.waitForChunksToLoad(), 8000, 'chunk load') } catch (e) {}
+      try { await withTimeout(worldBot.waitForChunksToLoad(), 8000, 'chunk load') } catch (e) {}
       const t1 = Date.now()
       await sleep(300)
       while (Date.now() - t1 < 3000 && Date.now() - s.lastEntitySpawnAt < 600) await sleep(100)
-      if (s.bot !== bot || gen !== s.worldGen || s.worldReady) return
+      if (s.bot !== worldBot || gen !== s.worldGen || s.worldReady) return
       s.worldReady = true
-      s.log('WORLD ready after', Date.now() - t0, 'ms, entities', Object.keys(bot.entities).length - 1)
+      s.log('WORLD ready after', Date.now() - t0, 'ms, entities', Object.keys(worldBot.entities).length - 1)
+    }
+    worldBot.on('spawn', () => {
+      hasSpawned = true
+      void waitForWorld()
+    })
+    // Velocity 切服可能只有 login 和位置同步，Mineflayer 不一定再次触发 spawn。
+    worldBot._client.on('position', ({ teleportId }) => {
+      if (s.bot !== worldBot || !hasSpawned || s.worldReady || waitingGen === s.worldGen) return
+      if (!Number.isInteger(teleportId) || teleportId < 0) return
+      if (worldBot.supportFeature('sendsPlayerLoadedPacket')) worldBot._client.write('player_loaded', {})
+      void waitForWorld()
     })
     // 被别的实体挤开：原版里这是客户端自己算的（服务端只推生物，不推玩家），
     // prismarine-physics 没实现，bot 就成了推不动的柱子。照原版 Entity.push 每 tick 加一点水平速度。
@@ -676,7 +694,7 @@ async function withTimeout(promise, ms, what) {
 // pathfinder 卡在实体碰撞箱（例如船顶）或未加载区块时会一声不响地原地转圈，
 // 以前 move_to 会一直占着动作锁直到客户端 HTTP 超时。这里按位移做看门狗。
 async function gotoWatched(s, goal, timeout, stallMs = 8000) {
-  const bot = s.bot
+  const bot = requireConnected(s)
   let last = bot.entity.position.clone()
   let lastMoveAt = Date.now()
   const sampler = setInterval(() => {
@@ -693,9 +711,16 @@ async function gotoWatched(s, goal, timeout, stallMs = 8000) {
       }
     }, 400)
   })
+  let onEnd
+  const disconnected = new Promise((_, reject) => {
+    onEnd = () => reject(new ApiError('not_connected', 'bot disconnected during pathfinding'))
+    bot.once('end', onEnd)
+  })
   try {
-    return await withTimeout(Promise.race([bot.pathfinder.goto(goal), stalled]), timeout, 'pathfinding')
+    await withTimeout(Promise.race([bot.pathfinder.goto(goal), stalled, disconnected]), timeout, 'pathfinding')
+    requireConnected(s, bot)
   } finally {
+    bot.removeListener('end', onEnd)
     clearInterval(sampler)
     if (watchdog) clearInterval(watchdog)
   }
@@ -708,18 +733,20 @@ const eyeToBlock = (s, p) => s.bot.entity.position.offset(0, s.bot.entity.eyeHei
 // 对斜下方的方块会出现"没走过去、眼睛却够不着"（线上 dig 原地 1 ms 报 out_of_reach），
 // 所以提前返回还要求眼睛距离在 reach 以内。寻路的 GoalNear 本身到达时眼睛距离 ≤ range+1.35，不受影响。
 async function goNear(s, pos, range, timeout = 60000, reach = null) {
-  if (s.bot.entity.position.distanceTo(pos) <= range + 0.5 && (reach === null || eyeToBlock(s, pos) <= reach)) return
+  const bot = requireConnected(s)
+  if (bot.entity.position.distanceTo(pos) <= range + 0.5 && (reach === null || eyeToBlock(s, pos) <= reach)) return
   let resets = 0
   const onReset = r => { if (r === 'place_error' || r === 'dig_error') resets++ }
-  s.bot.on('path_reset', onReset)
+  bot.on('path_reset', onReset)
   try {
     await gotoWatched(s, new goals.GoalNear(pos.x, pos.y, pos.z, range), timeout)
   } catch (e) {
-    s.bot.pathfinder.setGoal(null)
-    if (!s.bot) fail('disconnected', 'bot disconnected during action')
-    if (e instanceof ApiError) { e.extra = { pos: fmt(s.bot.entity.position), dist_left: +s.bot.entity.position.distanceTo(pos).toFixed(1), resets }; throw e }
-    fail('path_not_found', e.message, { from: fmt(s.bot.entity.position), to: fmt(pos) })
-  } finally { if (s.bot) s.bot.removeListener('path_reset', onReset) }
+    bot.pathfinder.setGoal(null)
+    requireConnected(s, bot)
+    const from = bot.entity.position
+    if (e instanceof ApiError) { e.extra = { pos: fmt(from), dist_left: +from.distanceTo(pos).toFixed(1), resets }; throw e }
+    fail('path_not_found', e.message, { from: fmt(from), to: fmt(pos) })
+  } finally { bot.removeListener('path_reset', onReset) }
 }
 
 // 桶：原版是"使用物品"包（use_item），服务端按玩家视线做射线判定，
@@ -881,6 +908,7 @@ async function driveVehicle(s, tx, tz, range, timeout) {
   let speed = 0
   let dist = Infinity
   while (Date.now() - t0 < timeout) {
+    requireConnected(s, b)
     if (!b.vehicle) fail('dismounted', `no longer riding ${first.name} (vehicle vanished mid-drive)`)
     const p = b.vehicle.position
     const dx = tx - p.x
@@ -908,6 +936,7 @@ async function driveVehicle(s, tx, tz, range, timeout) {
     })
     await sleep(DT)
   }
+  requireConnected(s, b)
   if (dist > range) {
     fail('drive_timeout', `${first.name} did not reach target`, { pos: fmt(b.entity.position), dist: +dist.toFixed(1), started })
   }
@@ -1073,15 +1102,23 @@ function hasArrow(bot) {
 }
 
 async function collectDrops(s, near, radius = 4) {
+  const bot = requireConnected(s)
   await sleep(400)
   for (let k = 0; k < 4; k++) {
-    const drop = Object.values(s.bot.entities)
+    requireConnected(s, bot)
+    const drop = Object.values(bot.entities)
       .filter(e => e.name === 'item' && e.position.distanceTo(near) < radius)
-      .sort((a, b) => a.position.distanceTo(s.bot.entity.position) - b.position.distanceTo(s.bot.entity.position))[0]
+      .sort((a, b) => a.position.distanceTo(bot.entity.position) - b.position.distanceTo(bot.entity.position))[0]
     if (!drop) return
     try { await goNear(s, drop.position, 0.5, 8000) } catch { return }
     await sleep(300)
   }
+}
+
+function movementCoordinate(value, axis) {
+  if (typeof value === 'string' && value.trim()) value = Number(value)
+  if (!Number.isFinite(value)) fail('bad_args', `move_to requires a finite ${axis} coordinate`)
+  return value
 }
 
 // 对实体右键：无 item 就是"用一下"（上船/上马/村民对话），有 item 就是把物品用在它身上
@@ -1909,6 +1946,8 @@ const api = {
       biome: feet && feet.biome && feet.biome.name, on_ground: e.onGround,
       // ready：就绪适配器确认已在目标服务器且存活，可以调用动作接口
       alive: s.alive, ready: !!(s.alive && s.isReady()), busy: s.busy && s.busy.name,
+      // server：多后端部署时这个账号被分配到的后端（就绪适配器给出才有）
+      ...(s.readiness && s.readiness.server ? { server: s.readiness.server } : {}),
       nearest_hostile: s.nearestHostile(24),
       ...(s.lastDeath ? { last_death: s.lastDeath } : {})
     }
@@ -2037,21 +2076,26 @@ const api = {
 
   // ---------- actions ----------
   async move_to(s, { x, y, z, range = 1, entity_id, timeout = 60000 }) {
-    if (!s.bot) fail('not_connected', 'bot not connected')
-    const dimensionBefore = s.bot.game.dimension
+    const bot = requireConnected(s)
+    const dimensionBefore = bot.game.dimension
+    if (entity_id === undefined) {
+      x = movementCoordinate(x, 'x')
+      z = movementCoordinate(z, 'z')
+      if (y != null && !bot.vehicle) y = movementCoordinate(y, 'y')
+    }
     // 骑着东西时不能走，只能掌舵：同一个接口自动切到载具模式（y 忽略）
-    if (s.bot.vehicle) {
-      const target = entity_id !== undefined ? s.bot.entities[entity_id] : null
+    if (bot.vehicle) {
+      const target = entity_id !== undefined ? bot.entities[entity_id] : null
       if (entity_id !== undefined && !target) fail('no_such_entity', `entity ${entity_id} not visible`)
       const tx = target ? target.position.x : x
       const tz = target ? target.position.z : z
-      if (tx === undefined || tz === undefined) fail('bad_args', 'vehicle mode needs x/z or entity_id')
       const out = await driveVehicle(s, tx, tz, Math.max(range, 1.5), timeout)
-      return { ...out, pos: fmt(s.bot.entity.position), drove: true }
+      requireConnected(s, bot)
+      return { ...out, pos: fmt(bot.entity.position), drove: true }
     }
     try {
       if (entity_id !== undefined) {
-        const e = s.bot.entities[entity_id]
+        const e = bot.entities[entity_id]
         if (!e) fail('no_such_entity', `entity ${entity_id} not visible`)
         await goNear(s, e.position, Math.max(range, 2), timeout)
       } else if (y === undefined || y === null) {
@@ -2059,23 +2103,26 @@ const api = {
         try {
           await gotoWatched(s, new goals.GoalNearXZ(x, z, range), timeout)
         } catch (e) {
-          s.bot.pathfinder.setGoal(null)
+          bot.pathfinder.setGoal(null)
+          requireConnected(s, bot)
           if (e instanceof ApiError) throw e
-          fail('path_not_found', e.message, { pos: fmt(s.bot.entity.position), ms: Date.now() - t0 })
+          fail('path_not_found', e.message, { pos: fmt(bot.entity.position), ms: Date.now() - t0 })
         }
       } else {
-        await goNear(s, new Vec3(x, y ?? s.bot.entity.position.y, z), range, timeout)
+        await goNear(s, new Vec3(x, y, z), range, timeout)
       }
     } catch (e) {
       // Entering an End portal changes dimension immediately. Pathfinder then
       // rejects its old-world goal, even though the requested movement worked.
-      if (s.bot && s.bot.game.dimension !== dimensionBefore) {
-        s.bot.pathfinder.setGoal(null)
-        return { pos: fmt(s.bot.entity.position), dimension_changed: { from: dimensionBefore, to: s.bot.game.dimension } }
+      requireConnected(s, bot)
+      if (bot.game.dimension !== dimensionBefore) {
+        bot.pathfinder.setGoal(null)
+        return { pos: fmt(bot.entity.position), dimension_changed: { from: dimensionBefore, to: bot.game.dimension } }
       }
       throw e
     }
-    return { pos: fmt(s.bot.entity.position) }
+    requireConnected(s, bot)
+    return { pos: fmt(bot.entity.position) }
   },
   async dig(s, { x, y, z, collect = true }) {
     if (!s.bot) fail('not_connected', 'bot not connected')
@@ -2241,29 +2288,34 @@ const api = {
   // 攻击：按手持物品的原版攻速挥击（空手 250ms、剑 625ms、斧 1000ms…），
   // max_hits 用于"打一下就走"（风筝苦力怕、单次敲船/矿车）。
   async attack(s, { entity_id, timeout = 20000, max_hits, interval_ms }) {
-    if (!s.bot) fail('not_connected', 'bot not connected')
-    const e = s.bot.entities[entity_id]
+    const bot = requireConnected(s)
+    const e = bot.entities[entity_id]
     if (!e) fail('no_such_entity', `entity ${entity_id} not visible`)
     if (max_hits !== undefined && (!Number.isInteger(max_hits) || max_hits < 1)) fail('bad_args', 'max_hits must be a positive integer')
     if (interval_ms !== undefined && (!Number.isFinite(interval_ms) || interval_ms < 50 || interval_ms > 5000)) fail('bad_args', 'interval_ms must be between 50 and 5000')
-    const weapon = s.bot.inventory.items().filter(i => /_sword$|_axe$/.test(i.name)).sort((a, b) => (b.name.includes('sword') - a.name.includes('sword')))[0]
-    if (weapon) await s.bot.equip(weapon, 'hand')
-    const interval = interval_ms ?? attackIntervalMs(s.bot.heldItem)
+    const weapon = bot.inventory.items().filter(i => /_sword$|_axe$/.test(i.name)).sort((a, b) => (b.name.includes('sword') - a.name.includes('sword')))[0]
+    if (weapon) await bot.equip(weapon, 'hand')
+    requireConnected(s, bot)
+    const interval = interval_ms ?? attackIntervalMs(bot.heldItem)
     const t0 = Date.now(); let hits = 0
-    s.bot.pathfinder.setGoal(new goals.GoalFollow(e, 1.5), true)
+    bot.pathfinder.setGoal(new goals.GoalFollow(e, 1.5), true)
     try {
-      while (s.bot && s.bot.entities[entity_id] && e.isValid && Date.now() - t0 < timeout && !s.interruptedBy) {
-        if (e.position.distanceTo(s.bot.entity.position) < 3.2) {
-          await s.bot.lookAt(e.position.offset(0, e.height * 0.8, 0), true)
-          s.bot.attack(e); hits++
+      while (s.bot === bot && bot.entities[entity_id] && e.isValid && Date.now() - t0 < timeout && !s.interruptedBy) {
+        requireConnected(s, bot)
+        if (e.position.distanceTo(bot.entity.position) < 3.2) {
+          await bot.lookAt(e.position.offset(0, e.height * 0.8, 0), true)
+          requireConnected(s, bot)
+          bot.attack(e); hits++
           if (max_hits && hits >= max_hits) break
         }
         await sleep(interval)
       }
-    } finally { s.bot.pathfinder.setGoal(null) }
-    const killed = !s.bot.entities[entity_id] || !e.isValid
+    } finally { bot.pathfinder.setGoal(null) }
+    requireConnected(s, bot)
+    const killed = !bot.entities[entity_id] || !e.isValid
     if (killed) await collectDrops(s, e.position, 5)
-    return { killed, hits, interval_ms: interval, ms: Date.now() - t0, inventory: invCounts(s.bot) }
+    requireConnected(s, bot)
+    return { killed, hits, interval_ms: interval, ms: Date.now() - t0, inventory: invCounts(bot) }
   },
   // Fire a bow, crossbow or trident at a visible entity or an explicit point.
   // The point form is useful for targets such as target blocks and buttons.

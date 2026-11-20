@@ -44,7 +44,7 @@ curl -s -X POST http://127.0.0.1:18900/api/v1/move_to \
 |---|---|---|
 | `http.host` / `http.port` | `127.0.0.1` / `18900` | API 监听地址。环境变量 `MC_AGENT_PORT` 可覆盖端口 |
 | `http.trustProxyHeaders` | `false` | 部署在反向代理 / Cloudflare Tunnel 后面时打开，登录限流按 `CF-Connecting-IP` / `X-Forwarded-For` 识别客户端 |
-| `http.loginRateLimit` | 10 次失败 / 60 s 锁定 / 全局 60 次每分钟 | `maxFailsPerIp`、`blockSeconds`、`maxGlobalPerMinute` |
+| `http.loginRateLimit` | 10 次失败 / 60 s 锁定 / 全局 60 次每分钟 | `maxFailsPerIp`、`blockSeconds`、`maxGlobalPerMinute` 均须为正整数 |
 | `minecraft.host` / `port` / `version` | `127.0.0.1` / `25565` / `1.21.11` | bot 连接的服务器 |
 | `session.tokenTtlHours` | `24` | token 有效期 |
 | `auth` | `{"type": "offline"}` | 认证适配器，见下 |
