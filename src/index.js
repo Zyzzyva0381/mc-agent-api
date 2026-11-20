@@ -12,7 +12,7 @@ const authProvider = createAuthProvider(config)
 const createReadiness = readinessFactory(config)
 
 core.configure({ config, createReadiness })
-web.configure({ config, authProvider })
+web.configure({ config, authProvider, readRoutes: createReadiness.readRoutes })
 
 // 运行期异常不能拖垮整个多实例服务。初始化错误应使进程以非零状态退出。
 process.on('uncaughtException', e => core.log('UNCAUGHT', e && e.stack || e))

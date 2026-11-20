@@ -8,14 +8,15 @@ const { log } = require('./session')
 const notConnected = message => ({ status: 200, json: JSON.stringify({ ok: false, error: { code: 'not_connected', message } }) })
 
 class BotProcess {
-  constructor ({ token, username, profile, botOptions, configPath }) {
+  constructor ({ token, username, profile, botOptions, config, route }) {
     this.token = token
     this.username = username
     this.profile = profile
     // 认证适配器给的 HTTP agent 不能跨进程传，子进程里由 prepareBotOptions 补回
     const { agent, ...rest } = botOptions || {}
     this.botOptions = rest
-    this.configPath = configPath
+    this.config = config
+    this.route = route
     this.createdAt = Date.now()
     this.pending = new Map()
     this.seq = 0
@@ -29,25 +30,29 @@ class BotProcess {
     const child = fork(path.join(__dirname, 'worker.js'), [], { stdio: 'inherit', serialization: 'advanced' })
     this.child = child
     child.on('message', m => {
-      if (!m || m.type !== 'reply') return
+      if (this.child !== child || !m || m.type !== 'reply') return
       const p = this.pending.get(m.id)
       if (p) { this.pending.delete(m.id); p(m) }
     })
-    child.on('error', e => log('BOTPROC', this.username, 'error', e.message))
-    child.on('exit', (code, signal) => {
+    const retire = reason => {
       if (this.child !== child) return
       this.child = null
-      for (const p of this.pending.values()) p(notConnected(`bot process exited (${signal || code})`))
+      for (const p of this.pending.values()) p(notConnected(`bot process unavailable (${reason})`))
       this.pending.clear()
       if (this.destroyed) return
       const now = Date.now()
       this.restarts = this.restarts.filter(t => now - t < 600000)
-      if (this.restarts.length >= 5) { log('BOTPROC', this.username, 'exited', signal || code, '- too many restarts, giving up'); return }
+      if (this.restarts.length >= 5) { log('BOTPROC', this.username, reason, '- too many restarts, giving up'); return }
       this.restarts.push(now)
-      log('BOTPROC', this.username, 'exited', signal || code, '- restarting in 2 s')
+      log('BOTPROC', this.username, reason, '- restarting in 2 s')
       setTimeout(() => { if (!this.destroyed && !this.child) this.spawn() }, 2000).unref()
+    }
+    child.on('error', e => retire(e.message))
+    child.on('disconnect', () => retire('IPC disconnected'))
+    child.on('exit', (code, signal) => retire(`exit ${signal || code}`))
+    child.send({ type: 'init', config: this.config, route: this.route, token: this.token, username: this.username, profile: this.profile, botOptions: this.botOptions, createdAt: this.createdAt }, error => {
+      if (error) { child.kill(); retire(error.message) }
     })
-    child.send({ type: 'init', configPath: this.configPath, token: this.token, username: this.username, profile: this.profile, botOptions: this.botOptions, createdAt: this.createdAt })
   }
 
   // 转发一次 API 调用，返回 { status, json }
@@ -57,7 +62,10 @@ class BotProcess {
     const id = ++this.seq
     return new Promise(resolve => {
       this.pending.set(id, resolve)
-      try { child.send({ type: 'call', id, name, args }) } catch (e) { this.pending.delete(id); resolve(notConnected('bot process unavailable: ' + e.message)) }
+      const onError = error => {
+        if (error && this.pending.delete(id)) resolve(notConnected('bot process unavailable: ' + error.message))
+      }
+      try { child.send({ type: 'call', id, name, args }, onError) } catch (error) { onError(error) }
     })
   }
 

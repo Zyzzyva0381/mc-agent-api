@@ -31,6 +31,7 @@ function readinessFactory (config) {
   else throw new Error(`unknown readiness.type ${JSON.stringify(r.type)} (expected ${Object.keys(BUILTIN).join(' / ')} or readiness.module)`)
   const factory = session => mod.create(session, r, config)
   factory.adapterName = r.module ? path.basename(r.module) : r.type
+  if (!r.module && r.type === 'proxy') factory.readRoutes = mod.prepare(r, config)
   return factory
 }
 

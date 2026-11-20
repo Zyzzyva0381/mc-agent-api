@@ -6,24 +6,30 @@ const { api, READONLY, ApiError, fmt } = require('./session')
 // 这些观察接口要用到世界 / 实体；重连途中 bot 对象已建好但世界还没装上，以前会报
 // internal "Cannot read properties of undefined (reading 'getBlock' / 'position')"
 const NEED_WORLD = new Set(['get_block', 'find_blocks', 'get_entities', 'inventory'])
+const PROXY_WORLD_ENDPOINTS = new Set([...NEED_WORLD, 'advancements', 'posture', 'look'])
+
+function readinessError (session) {
+  const state = session.readiness.guardsWorld ? session.readiness.state() : null
+  if (state === 'backend_unavailable') return { code: 'backend_unavailable', message: 'cannot confirm player presence on the target server' }
+  if (session.bot && session.readiness.isReady() && !session.worldReady) return { code: 'not_ready', message: 'world is still loading; retry in a moment' }
+  return { code: 'wrong_server', message: 'bot is not ready on the target server' }
+}
 
 // 返回 { status, body }：status 是 HTTP 状态码，body 是响应 JSON
 async function dispatch (session, name, args) {
-  if (!api[name]) return { status: 404, body: { ok: false, error: { code: 'unknown_api', path: name } } }
+  if (!Object.hasOwn(api, name)) return { status: 404, body: { ok: false, error: { code: 'unknown_api', path: name } } }
   const isAction = !READONLY.has(name)
   const b = session.bot
+  if ((isAction || (session.readiness.guardsWorld && PROXY_WORLD_ENDPOINTS.has(name))) && !session.isReady()) {
+    return { status: 200, body: { ok: false, error: readinessError(session) } }
+  }
   if (NEED_WORLD.has(name) && b && !(b.entity && b.world && typeof b.blockAt === 'function' && b.inventory)) {
     return { status: 200, body: { ok: false, error: { code: 'not_ready', message: 'bot is (re)connecting, world not loaded yet; retry in a moment' } } }
   }
 
   // Action guards
   if (isAction) {
-    if (!session.isReady() && name !== 'connect') {
-      // 已在比赛服、只是登录 / 重生 / 切维度后区块和实体还没到齐：给 not_ready，别误报成 wrong_server
-      if (session.bot && session.readiness.isReady() && !session.worldReady) return { status: 200, body: { ok: false, error: { code: 'not_ready', message: 'world is still loading (after login, respawn or dimension change); retry in a moment' } } }
-      return { status: 200, body: { ok: false, error: { code: 'wrong_server', message: 'bot is not ready on the target server' } } }
-    }
-    if (!session.alive && name !== 'connect') return { status: 200, body: { ok: false, error: { code: 'dead', message: 'bot is dead, waiting for respawn' } } }
+    if (!session.alive) return { status: 200, body: { ok: false, error: { code: 'dead', message: 'bot is dead, waiting for respawn' } } }
     if (session.busy) return { status: 200, body: { ok: false, error: { code: 'busy', message: `running ${session.busy.name}` } } }
     session.busy = { name, t: Date.now() }
     // 其它动作开始前先松开 control wait:false 留下的按键（control 自己会处理）
@@ -35,8 +41,11 @@ async function dispatch (session, name, args) {
 
   const t0 = Date.now()
   try {
-    const result = await api[name](session, args)
+    const protectAction = session.readiness.guardsWorld && (isAction || name === 'look' || name === 'posture')
+    const invoke = () => api[name](session, args)
+    const result = await (protectAction ? session.withBackendAction(invoke) : invoke())
     if (isAction && session.interruptedBy) {
+      if (session.interruptedBy === 'server_changed') throw new ApiError('interrupted', 'target server verification was lost', { cause: 'server_changed' })
       if (session.interruptedBy !== 'death' && result && Object.keys(result).length) result.interrupted_by = session.interruptedBy
       else throw new ApiError(session.interruptedBy === 'death' ? 'dead' : 'interrupted', `stopped because of ${session.interruptedBy}`)
     }
@@ -46,13 +55,13 @@ async function dispatch (session, name, args) {
     // 动作进行中 bot 被 /disconnect、踢出或断线：s.bot 变成 null，动作里随后的属性访问会抛 TypeError，
     // 以前报成 internal "Cannot read properties of null (reading 'pathfinder')"
     if (isAction && !session.bot && !e.code) e = new ApiError('not_connected', `bot disconnected while ${name} was running`)
-    if (isAction && session.bot && (!session.alive || session.bot.health <= 0)) session.interruptedBy = 'death'
+    if (isAction && session.interruptedBy !== 'server_changed' && session.bot && (!session.alive || session.bot.health <= 0)) session.interruptedBy = 'death'
     if (isAction && session.interruptedBy && !['interrupted', 'dead'].includes(e.code)) {
       const inner = e
       e = new ApiError(session.interruptedBy === 'death' ? 'dead' : 'interrupted', `stopped because of ${session.interruptedBy} (${inner.message})`)
       e.extra = { ...(inner.extra || {}), ...(inner.code ? { inner_code: inner.code } : {}) }
     }
-    if (['interrupted', 'dead'].includes(e.code) && session.bot?.entity) e.extra = { ...(e.extra || {}), cause: session.interruptedBy, health: session.bot.health, pos: fmt(session.bot.entity.position), nearest_hostile: session.nearestHostile(24), ...(session.interruptedBy === 'death' ? { death: session.lastDeath } : {}) }
+    if (['interrupted', 'dead'].includes(e.code) && session.bot?.entity && (!session.readiness.guardsWorld || session.isReady()) && e.extra?.cause !== 'server_changed') e.extra = { ...(e.extra || {}), cause: session.interruptedBy, health: session.bot.health, pos: fmt(session.bot.entity.position), nearest_hostile: session.nearestHostile(24), ...(session.interruptedBy === 'death' ? { death: session.lastDeath } : {}) }
     session.log('API', name, 'FAIL', e.code || 'internal', e.message)
     return { status: 200, body: { ok: false, ms: Date.now() - t0, error: { code: e.code || 'internal', message: e.message, ...(e.extra || {}) } } }
   } finally {

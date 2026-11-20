@@ -88,6 +88,7 @@ POST /auth/login
 | 401 | `no_profile` | 外置登录（yggdrasil）账号下没有选定角色 |
 | 429 | `rate_limited` | 上游认证服务限频（`retry_after_s` 为空，等几秒重试） |
 | 429 | `rate_limited` | **本服务限流**：同一 IP 每分钟最多 10 次失败，超过锁 60 秒；全局每分钟最多 60 次尝试（均可在 `http.loginRateLimit` 配置）。带 `retry_after_s` 与 `Retry-After` 响应头 |
+| 503 | `routing_unavailable` | 分配表缺失或无效。新登录暂停，已有 token 保持原分配 |
 
 限流的客户端身份默认取 socket 地址；配置 `http.trustProxyHeaders: true` 后改取 `CF-Connecting-IP` / `X-Forwarded-For`（只在确实部署于反向代理之后时打开，否则可被伪造）。登录成功会清零该 IP 的失败计数。
 
@@ -116,7 +117,7 @@ POST /connect
 
 `result`：`{"ok": true}`；已在线时 `{"ok": true, "already_connected": true}`。断线重连需间隔 ≥ 30 秒，死亡循环冷却期间返回 `death_loop_cooldown`（附 `cooldown_remaining_seconds`）。
 
-`status.ready` 由部署方配置的就绪适配器和世界加载状态共同决定。代理模式下，`status.server` 显示分配的目标后端。等 `ready: true` 再读取坐标、背包和方块数据，因为切服期间这些数据可能来自中转服务器。代理模式的登录名和分配表见 `docs/ADAPTERS.md`。
+`status.ready` 由部署方配置的就绪适配器和世界加载状态共同决定。内置代理适配器按认证角色名为每个 token 固定后端，`status.server` 显示目标。切服或确认中断期间，`/status` 只返回连接信息。坐标、背包、方块和进度等数据在目标世界就绪后提供。配置说明见 `docs/ADAPTERS.md`。
 
 已经连着但尚未就绪时，`/connect` 会请求适配器重试，实际发送受重试间隔限制。接口可能返回：
 
@@ -124,7 +125,7 @@ POST /connect
 {"ok": true, "already_connected": true, "ready": false}
 ```
 
-适配器可能附带额外字段。切服等待期间，挖掘等动作可能返回 `wrong_server`；在目标服务器上等待世界加载时，可能返回 `not_ready`。目标不可用或后端确认故障持续时，重试可能一直无法就绪。
+适配器可能附带额外字段。切服等待期间，观察和动作可能返回 `wrong_server`；在目标服务器上等待世界加载时，可能返回 `not_ready`。内置代理适配器在后端确认失联时返回 `backend_unavailable`，恢复确认后同一个 token 可以继续使用。
 
 ### 2.2 断开
 
@@ -187,6 +188,7 @@ GET /status
     "alive": true,
     "ready": true,
     "server": "survival2",
+    "readiness_state": "ready",
     "busy": null,
     "nearest_hostile": {"id": 812, "name": "zombie", "dist": 12.5},
     "last_death": {"pos": [80, 63, -180], "t": 1791881333488, "cause": "Agent_1 was slain by Zombie"}
@@ -196,7 +198,7 @@ GET /status
 
 | 字段 | 说明 |
 |---|---|
-| `ready` | API 的连接就绪状态。通常在确认目标后端并等待区块和实体加载后置为 `true`。死亡重生或切换维度会重新等待世界加载。执行动作前也要检查 `alive` |
+| `ready` | bot 存活且可执行动作。死亡重生或切换维度会重新等待世界加载 |
 | `busy` | 正在执行的动作名，空闲为 `null` |
 | `speed` | 当前水平速度（格/秒，3 位小数），按 bot **上一个物理 tick 的实际位移**算。参考：步行约 4.3、疾跑约 5.6、站着 0；为 `null` 的情况同 `velocity` |
 | `velocity` | 上一个物理 tick 的实际位移 `[vx, vy, vz]` × 20（格/秒），Y 正值向上；下落、被击退、被水流冲时都会体现。刚传送 / 上下载具后的第一个 tick、骑乘中、还没有物理数据时为 `null` |
@@ -212,6 +214,7 @@ GET /status
 | `sneaking` / `jumping` / `blocking` | 当前姿态，与 `/posture` 对应（`jumping` 为持续按住跳跃，水里即踩水浮面） |
 | `held_controls` | `/control` `wait:false` 正在按住的键：`{"keys": ["forward"], "release_in_ms": 120}`；没有时为 `null` |
 | `server` | 代理就绪适配器为会话选定的目标后端名（`/server` 后面那个名字）。切服期间这个字段仍显示目标；各后端分别保存世界、背包和进度 |
+| `readiness_state` | 内置代理适配器的状态。可能为 `connecting`、`switching`、`loading_world`、`backend_unavailable`、`dead` 或 `ready` |
 | `using_item` | 正在使用物品时返回 `{"name","elapsed_ms"}` |
 | `nearest_hostile` | 24 格内最近的敌对生物，没有则省略 |
 | `last_death` | 最近一次死亡的位置、时间、死亡信息 |
@@ -792,6 +795,7 @@ POST /stop
 | `unauthorized` / `invalid_token` | Token 缺失或失效 |
 | `not_connected` | Bot 未连接；动作执行中途被 `/disconnect`、踢出或断线也返回它 |
 | `wrong_server` | 还没就绪（不在目标服务器上） |
+| `backend_unavailable` | 暂时无法确认 bot 在目标服务器，等待后端确认恢复 |
 | `not_ready` | 数据（如进度）还没下发；或登录 / 重生 / 切维度后世界还在加载（稍等重试） |
 | `death_loop_cooldown` | 死亡循环保护中 |
 | `busy` | 有动作正在执行 |
@@ -953,6 +957,7 @@ curl -s -X POST http://127.0.0.1:18900/api/v1/posture \
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 1.3.16 | 2026-11-20 | 按认证角色固定分配；分配表异常暂停新登录；切服和确认中断期间暂停世界接口，RCON 恢复后同一会话继续 |
 | 1.3.15 | 2026-11-20 | 支持按角色分配代理后端，`/status.server` 显示目标；修复 Velocity 切服后世界就绪状态未恢复，以及断线时动作报错；限制 HTTP 请求体为 1 MiB |
 | 1.3.14 | 2026-11-16 | 新增 `/control` `"wait": false`（实时操控）：按下就返回（服务端约 1 ms，以前要等满 `ms`），键在后台按住 `ms` 后松开，下一个 `/control` 立刻接管；`{"wait": false}` 空调用立即松开；`/status` 新增 `held_controls` |
 | 1.3.13 | 2026-11-16 | 23 个 bot 压测后的修复：① **每个 bot 一个进程**——以前所有 bot 共用一个 Node 线程，任何一个 bot 寻路或大范围 `find_blocks` 都会拖慢所有人，23 个 bot 同时干活时 `status` p99 4.5 s、`control` p99 4 s；现在同样负载下 `status` p99 3 ms、`control`（ms=100）p99 106 ms，全部 bot 满负荷重计算时 `status` p99 约 50 ms；② 后端在线人数超过 13 时，服务器 RCON `list` 只列前 13 个名字，之后的 bot 会被误判为"不在后端"而反复 `/server`、断线重登（在线人数在 20–23 之间跳）——现在被截断时逐个确认；③ `find_blocks` 改为直接按方块状态扫描并分段让出：半径 64 从约 0.4–3.6 s 降到约 0.1 s；以前的实现按区块"八面体"遍历，会漏掉对角方向、但仍在半径内的方块，现在结果更完整（数量会比以前多）；④ 重连途中调用 `get_block` / `find_blocks` / `get_entities` / `inventory` 返回 `not_ready`，以前是 `internal`；⑤ 寻路每个 tick 最多计算 20 ms（以前 40 ms） |

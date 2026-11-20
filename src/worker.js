@@ -4,12 +4,11 @@
 // 主进程（http.js）负责 HTTP、认证和 token；这里只跑一个 Session，并处理主进程转发来的 API 调用。
 //
 // 消息（主进程 → 子进程）：
-//   { type: 'init', configPath, token, username, profile, botOptions, createdAt }
+//   { type: 'init', config, route, token, username, profile, botOptions, createdAt }
 //   { type: 'call', id, name, args }
 //   { type: 'destroy' }
 // 消息（子进程 → 主进程）：
 //   { type: 'reply', id, status, json }      json 是已序列化的响应体
-const { loadConfig } = require('./config')
 const { createAuthProvider } = require('./auth')
 const { readinessFactory } = require('./readiness')
 const core = require('./session')
@@ -43,12 +42,12 @@ async function handleCall (m) {
 process.on('message', m => {
   if (!m || typeof m !== 'object') return
   if (m.type === 'init') {
-    const config = loadConfig(m.configPath)
+    const { config } = m
     const authProvider = createAuthProvider(config)
     core.configure({ config, createReadiness: readinessFactory(config) })
     // 不能跨进程传的部分（例如 yggdrasil 的 sessionserver HTTP agent）由认证适配器在子进程里补回
     const botOptions = authProvider.prepareBotOptions ? authProvider.prepareBotOptions(m.botOptions) : m.botOptions
-    session = new core.Session(m.token, m.username, m.profile, botOptions)
+    session = new core.Session(m.token, m.username, m.profile, botOptions, m.route)
     session.createdAt = m.createdAt
     core.sessions.set(m.token, session)
     session.connect()

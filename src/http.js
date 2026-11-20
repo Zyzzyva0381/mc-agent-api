@@ -12,11 +12,13 @@ const MAX_BODY_BYTES = 1024 * 1024
 
 let config = null
 let authProvider = null
+let readRoutes = null
 const tokenTtlMs = () => config.session.tokenTtlHours * 60 * 60 * 1000
 
 function configure (opts) {
   config = opts.config
   authProvider = opts.authProvider
+  readRoutes = opts.readRoutes
 }
 
 // ---------- /auth/login 限流 ----------
@@ -47,7 +49,6 @@ function loginRateState (ip) {
   if (loginAttempts.length >= config.http.loginRateLimit.maxGlobalPerMinute) {
     return { blocked: true, retry: 30, reason: 'global' }
   }
-  loginAttempts.push(now)
   return { blocked: false }
 }
 
@@ -100,6 +101,7 @@ async function handleRequest (req, res) {
   const body = Buffer.concat(chunks, bytes).toString('utf8')
   let args = {}
   try { args = body ? JSON.parse(body) : {} } catch { return send(400, { ok: false, error: { code: 'bad_json' } }) }
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return send(400, { ok: false, error: { code: 'bad_args', message: 'request body must be a JSON object' } })
   // 查询串：文档里 /events 写的是 GET ?since=&limit=，之前只读 body 导致参数被静默忽略。
   // 查询参数作为基础值，JSON body 优先（同名时以 body 为准）。
   const qIndex = req.url.indexOf('?')
@@ -124,15 +126,24 @@ async function handleRequest (req, res) {
     }
     const { username, password } = args
     if (!username || typeof username !== 'string') return send(400, { ok: false, error: { code: 'bad_args', message: 'username required' } })
+    let routeFor
     try {
+      if (readRoutes) routeFor = readRoutes()
+    } catch (e) {
+      log('ROUTING UNAVAILABLE', e.message)
+      return send(503, { ok: false, error: { code: 'routing_unavailable', message: 'server assignments are temporarily unavailable' } })
+    }
+    try {
+      loginAttempts.push(Date.now())
       const { profile, botOptions } = await authProvider.authenticate({ username, password })
+      const route = routeFor && routeFor(profile.name)
       // 同一角色只能有一个 bot 在线：作废旧 session，避免新旧 bot 互踢
       for (const old of [...sessions.values()]) {
         if (old.profile.id === profile.id) { log('REPLACE', profile.name); old.destroy(); sessions.delete(old.token) }
       }
       const token = crypto.randomBytes(32).toString('hex')
       // 子进程启动后自动连接
-      const session = new BotProcess({ token, username, profile, botOptions, configPath: config.configPath })
+      const session = new BotProcess({ token, username, profile, botOptions, config, route })
       sessions.set(token, session)
       noteLoginSuccess(ip)
       log('LOGIN', username, '->', profile.name, 'from', ip)

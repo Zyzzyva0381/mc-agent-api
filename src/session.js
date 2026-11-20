@@ -4,6 +4,7 @@
 const mineflayer = require('mineflayer')
 const { pathfinder, Movements, goals } = require('mineflayer-pathfinder')
 const { Vec3 } = require('vec3')
+const { AsyncLocalStorage } = require('node:async_hooks')
 const { createMotionTracker } = require('./motion')
 
 const sleep = ms => new Promise(r => setTimeout(r, ms))
@@ -23,16 +24,21 @@ class ApiError extends Error {
   constructor(code, message, extra) { super(message); this.code = code; this.extra = extra }
 }
 const fail = (code, msg, extra) => { throw new ApiError(code, msg, extra) }
+const CONNECTION_EVENTS = new Set(['server_confirmed', 'kicked', 'disconnected', 'reconnect', 'reconnect_failed'])
+const backendAction = new AsyncLocalStorage()
 function requireConnected(s, bot = s.bot) {
   if (s.bot !== bot || !bot?.entity) fail('not_connected', 'bot is no longer connected')
+  s.requireBackendAction?.()
   return bot
 }
 
 class Session {
-  constructor(token, username, profile, botOptions) {
+  constructor(token, username, profile, botOptions, route) {
     this.token = token
     this.username = username
     this.profile = profile
+    this.route = route
+    this.backendGeneration = 0
     // 认证适配器给出的 mineflayer.createBot 参数（username / auth / session / sessionServer ...）
     this.botOptions = botOptions
     this.createdAt = Date.now()
@@ -73,6 +79,27 @@ class Session {
     return !!this.bot && !!this.worldReady && !!this.readiness.isReady()
   }
 
+  withBackendAction (perform) {
+    return backendAction.run({ session: this, generation: this.backendGeneration }, async () => {
+      try { return await perform() } finally { this.requireBackendAction() }
+    })
+  }
+
+  backendActionIsCurrent () {
+    const action = backendAction.getStore()
+    return action?.session !== this || (action.generation === this.backendGeneration && this.readiness.isReady())
+  }
+
+  requireBackendAction () {
+    if (!this.backendActionIsCurrent()) fail('interrupted', 'target server verification was lost', { cause: 'server_changed' })
+  }
+
+  onBackendConfirmed () {
+    if (!this.bot?.entity || !this.isReady() || this.spawnEventGen === this.worldGen) return
+    this.spawnEventGen = this.worldGen
+    this.pushEvent('spawn', { pos: fmt(this.bot.entity.position) })
+  }
+
   hardReconnect (reason) {
     const s = this
     if (s.reconnectPending || s.destroyed || !s.bot) return
@@ -93,6 +120,7 @@ class Session {
   log(...a) { log(`[${this.username}]`, ...a) }
 
   pushEvent(type, data) {
+    if (this.readiness?.guardsWorld && !CONNECTION_EVENTS.has(type) && !this.readiness.isReady()) return
     this.events.push({ seq: ++this.seq, t: Date.now(), type, ...data })
     if (this.events.length > 500) this.events.shift()
   }
@@ -121,6 +149,7 @@ class Session {
   applyPosture() {
     const b = this.bot
     if (!b || !b.entity) return
+    if (this.readiness.guardsWorld && !this.readiness.isReady()) return
     const held = this.heldControl ? this.heldControl.keys : []
     try { b.setControlState('sneak', !!this.posture.sneak || held.includes('sneak')) } catch {}
     try { b.setControlState('jump', !!this.posture.jump || held.includes('jump')) } catch {}
@@ -146,6 +175,21 @@ class Session {
     try { this.bot.setControlState('jump', false) } catch {}
   }
 
+  onBackendUnconfirmed() {
+    this.backendGeneration++
+    const b = this.bot
+    if (!b) return
+    backendAction.exit(() => {
+      this.clearPosture()
+      this.releaseHeld()
+      if (this.busy) this.interruptedBy = 'server_changed'
+      b.pathfinder.setGoal(null)
+      try { b.stopDigging() } catch {}
+      try { b.deactivateItem() } catch {}
+      b.clearControlStates()
+    })
+  }
+
   connect() {
     const s = this
     s.advancementDefinitions.clear()
@@ -155,13 +199,15 @@ class Session {
     s.advancementsUpdatedAt = null
     s.worldReady = false
     s.worldGen = 0
+    s.spawnEventGen = -1
     s.lastEntitySpawnAt = 0
     s.bot = mineflayer.createBot({
       host: config.minecraft.host, port: config.minecraft.port, version: config.minecraft.version,
       profilesFolder: false, checkTimeoutInterval: 30000,
       ...s.botOptions
     })
-    s.bot.loadPlugin(pathfinder)
+    const worldBot = s.bot
+    worldBot.loadPlugin(pathfinder)
     // mineflayer 回显 accepts teleport 用的 teleportId 来自它最后看到的 position 包。
     // Velocity 切后端（play -> configuration -> play）时会漏出一个没有 teleportId 的
     // position 事件，protodef 对 undefined 字段直接跳过，于是序列化出一个"空 body"的
@@ -185,6 +231,7 @@ class Session {
     const client = s.bot._client
     const clientWrite = client.write.bind(client)
     client.write = (name, params) => {
+      if (!s.backendActionIsCurrent()) return false
       if (client.state === 'play' && playOutPackets.size > 0 && !playOutPackets.has(name)) {
         s.log('SKIP unknown outbound packet ' + name + ' (not in ' + (s.bot && s.bot.version) + ' play.toServer)')
         return false
@@ -298,6 +345,7 @@ class Session {
     // Mineflayer itself does not expose advancements, but minecraft-protocol fully parses this packet.
     // The packet is a full reset on login/server switch, followed by incremental definition/progress updates.
     s.bot._client.on('advancements', p => {
+      if (s.bot !== worldBot) return
       if (p.reset) {
         s.advancementDefinitions.clear()
         s.advancementProgress.clear()
@@ -348,13 +396,15 @@ class Session {
       if (!s.bot || e !== s.bot.entity || !s.mcData || !eff) return
       s.pushEvent('effect_end', { name: effectName(s, eff.id) })
     })
-    s.bot.on('spawn', () => setTimeout(() => {
-      if (!s.bot) return
-      if (s.bot.vehicle) { const v = s.bot.vehicle; s.bot.vehicle = null; s.bot.emit('dismount', v); s.log('WATCHDOG cleared phantom vehicle', v.name) }
-      // 坐标用"相对 0"：位置不变，且 mineflayer 只在绝对坐标时清速度——
-      // 以前用绝对坐标，进服第 4 秒恰好挨打 / 跳跃 / 下落时速度会被清零（击退被吞）
-      s.bot._client.emit('position', { teleportId: -1, x: 0, y: 0, z: 0, dx: 0, dy: 0, dz: 0, yaw: 0, pitch: 0, flags: { x: true, y: true, z: true, yaw: true, pitch: true, dx: false, dy: false, dz: false } })
-    }, 4000))
+    worldBot.on('spawn', () => {
+      const gen = s.worldGen
+      setTimeout(() => {
+        if (s.bot !== worldBot || gen !== s.worldGen) return
+        if (worldBot.vehicle) { const v = worldBot.vehicle; worldBot.vehicle = null; worldBot.emit('dismount', v); s.log('WATCHDOG cleared phantom vehicle', v.name) }
+        // 相对位移为 0，保留真实击退速度。
+        worldBot._client.emit('position', { teleportId: -1, x: 0, y: 0, z: 0, dx: 0, dy: 0, dz: 0, yaw: 0, pitch: 0, flags: { x: true, y: true, z: true, yaw: true, pitch: true, dx: false, dy: false, dz: false } })
+      }, 4000).unref()
+    })
     s.bot.once('spawn', () => {
       s.bot.physics.playerHalfWidth = 0.3001
       s.mcData = require('minecraft-data')(s.bot.version)
@@ -370,41 +420,39 @@ class Session {
       s.bot.pathfinder.tickTimeout = 20
       s.log('SPAWN', fmt(s.bot.entity.position))
     })
-    // 刚进服时区块还没下发，物理会把 bot 判成悬空而一路下坠（服务端也认），
-    // 掉进虚空或摔死。等区块到齐再开启物理。
-    s.bot.once('spawn', async () => {
-      s.bot.physicsEnabled = false
-      try {
-        await withTimeout(s.bot.waitForChunksToLoad(), 8000, 'chunk load')
-      } catch (e) {
-        s.log('CHUNKS wait failed:', e.message)
-      }
-      if (!s.bot) return
-      s.bot.physicsEnabled = true
-      s.log('PHYSICS enabled after chunks')
-    })
     // ready 还要等周围的区块和实体到齐：服务端先发区块、再陆续发实体，
     // 以前 ready 一变 true 就调 get_entities 常常拿到 []。每次（重新）进入一个后端世界都重新等：
     // 区块到齐（最多 8 s）后，再等到 600 ms 内没有新实体出现（最多再 3 s）。
-    s.bot.on('entitySpawn', () => { s.lastEntitySpawnAt = Date.now() })
+    worldBot.on('entitySpawn', () => { if (s.bot === worldBot) s.lastEntitySpawnAt = Date.now() })
     // 死亡重生、切维度走的是 respawn 包（不是 login），之前 ready 一直是 true，
     // 换完世界后约 0.25 s 内 get_block 会 not_loaded、get_entities 为空
-    const worldBot = s.bot
     let hasSpawned = false
     let waitingGen = -1
-    for (const ev of ['login', 'respawn']) worldBot.on(ev, () => { s.worldReady = false; s.worldGen++ })
+    const resetWorld = () => {
+      if (s.bot !== worldBot) return
+      s.worldReady = false
+      s.worldGen++
+      worldBot.physicsEnabled = false
+    }
+    for (const ev of ['login', 'respawn']) worldBot.on(ev, resetWorld)
+    worldBot._client.on('state', (state, previous) => { if (previous === 'play' && state !== 'play') resetWorld() })
     const waitForWorld = async () => {
       if (s.bot !== worldBot || s.worldReady || waitingGen === s.worldGen) return
       const gen = s.worldGen
       waitingGen = gen
       const t0 = Date.now()
       try { await withTimeout(worldBot.waitForChunksToLoad(), 8000, 'chunk load') } catch (e) {}
+      // 旧世界的异步回调不能提前开启新世界的物理。
+      if (s.bot !== worldBot || gen !== s.worldGen) return
+      worldBot.physicsEnabled = true
       const t1 = Date.now()
       await sleep(300)
       while (Date.now() - t1 < 3000 && Date.now() - s.lastEntitySpawnAt < 600) await sleep(100)
       if (s.bot !== worldBot || gen !== s.worldGen || s.worldReady) return
+      if (worldBot.isAlive && worldBot.health > 0) s.alive = true
       s.worldReady = true
       s.log('WORLD ready after', Date.now() - t0, 'ms, entities', Object.keys(worldBot.entities).length - 1)
+      if (s.readiness.guardsWorld) s.onBackendConfirmed()
     }
     worldBot.on('spawn', () => {
       hasSpawned = true
@@ -453,9 +501,10 @@ class Session {
         me.velocity.z -= dz
       }
     })
-    s.bot.on('spawn', () => s.pushEvent('spawn', { pos: fmt(s.bot.entity.position) }))
+    if (!s.readiness.guardsWorld) s.bot.on('spawn', () => s.pushEvent('spawn', { pos: fmt(s.bot.entity.position) }))
     s.bot.on('messagestr', (m, pos) => {
       if (pos === 'game_info') return
+      if (s.readiness.guardsWorld && !s.readiness.isReady()) return
       const text = m.replace(/\s+/g, ' ').trim()
       if (s.lastDeath && !s.lastDeath.cause && Date.now() - s.lastDeath.t < 3000 && text.startsWith(s.bot.username + ' ')) s.lastDeath.cause = text
       s.pushEvent('chat', { text: text.slice(0, 300) })
@@ -464,8 +513,10 @@ class Session {
     const DEATH_LOOP_THRESHOLD = 3
     const DEATH_LOOP_COOLDOWN = 5 * 60 * 1000
     s.bot.on('death', () => {
+      s.alive = false
+      if (s.readiness.guardsWorld && !s.readiness.isReady()) return
       s.lastDeath = { pos: fmt(s.bot.entity.position), t: Date.now(), dropped_items_at: fmt(s.bot.entity.position) }
-      s.pushEvent('death', s.lastDeath); s.alive = false; s.releaseHeld(); s.interrupt('death')
+      s.pushEvent('death', s.lastDeath); s.releaseHeld(); s.interrupt('death')
       s.clearPosture()
       const now = Date.now()
       s.recentDeaths.push(now)
@@ -479,12 +530,14 @@ class Session {
       }
     })
     s.bot.on('spawn', () => { s.alive = true })
-    let lastHealth = 20
+    let lastHealth
     // 服务端每次扣血前发 damage_event（1.19.4+），带 damage_type 注册表下标和来源实体（id+1，0 = 无）。
     // 记下来挂到 hurt 事件上，免得"被零星伤害打断"时无从查起。
     let lastDamage = null
+    for (const event of ['login', 'respawn']) worldBot.on(event, () => { lastHealth = undefined; lastDamage = null })
     s.bot._client.on('damage_event', p => {
       if (!s.bot || !s.bot.entity || p.entityId !== s.bot.entity.id) return
+      if (s.readiness.guardsWorld && !s.readiness.isReady()) return
       const causeId = (p.sourceCauseId || 0) - 1
       const cause = causeId >= 0 ? s.bot.entities[causeId] : null
       lastDamage = {
@@ -511,6 +564,7 @@ class Session {
     s.bot.on('kicked', r => { s.log('KICKED', JSON.stringify(r)); s.pushEvent('kicked', { reason: JSON.stringify(r).slice(0, 300) }) })
     s.bot.on('error', e => s.log('ERROR', e.message))
     s.bot.on('end', r => {
+      if (s.bot !== worldBot) return
       s.log('END', r)
       s.pushEvent('disconnected', { reason: r })
       s.bot = null
@@ -1913,6 +1967,10 @@ function autoPlaceSite(s) {
 const api = {
   // ---------- observation ----------
   async status(s) {
+    if (s.readiness.guardsWorld && !(s.bot?.entity && s.isReady())) {
+      const state = s.readiness.state()
+      return { username: s.profile.name, server: s.readiness.server, ready: false, readiness_state: state === 'confirmed' ? 'loading_world' : state }
+    }
     if (!s.bot || !s.bot.entity) fail('not_connected', 'bot not connected')
     const b = s.bot
     const e = b.entity
@@ -1947,7 +2005,8 @@ const api = {
       // ready：就绪适配器确认已在目标服务器且存活，可以调用动作接口
       alive: s.alive, ready: !!(s.alive && s.isReady()), busy: s.busy && s.busy.name,
       // server：多后端部署时这个账号被分配到的后端（就绪适配器给出才有）
-      ...(s.readiness && s.readiness.server ? { server: s.readiness.server } : {}),
+      ...(s.readiness.server ? { server: s.readiness.server } : {}),
+      ...(s.readiness.guardsWorld ? { readiness_state: s.alive ? 'ready' : 'dead' } : {}),
       nearest_hostile: s.nearestHostile(24),
       ...(s.lastDeath ? { last_death: s.lastDeath } : {})
     }
@@ -2741,6 +2800,7 @@ const api = {
       if (!it) fail('missing_item', 'no shield in inventory', { inventory: invCounts(s.bot) })
       await s.bot.equip(it, 'off-hand')
     }
+    s.requireBackendAction()
     if (wantShield !== s.posture.shield) {
       if (wantShield) s.bot.activateItem(true)
       else try { s.bot.deactivateItem() } catch {}
@@ -2756,6 +2816,7 @@ const api = {
     }
     // 潜行 / 跳跃随下一个物理 tick（50 ms）发出，举盾的 use_item 是立即发的；以前固定等 150 ms，战斗里每次切姿态白白多 100 ms
     await sleep(55)
+    s.requireBackendAction()
     return {
       sneaking: !!s.bot.getControlState('sneak'),
       jumping: !!s.bot.getControlState('jump'),
@@ -2954,6 +3015,7 @@ const api = {
     const np = Number(tp ?? s.bot.entity.pitch)
     if (!Number.isFinite(ny) || !Number.isFinite(np)) fail('bad_args', 'yaw/pitch must be finite numbers')
     await s.bot.look(ny, np, true)
+    s.requireBackendAction()
     return { yaw: +s.bot.entity.yaw.toFixed(3), pitch: +s.bot.entity.pitch.toFixed(3) }
   },
 
@@ -2993,6 +3055,8 @@ const api = {
     return { ok: true, reconnect: true }
   },
   async disconnect(s) {
+    s.reconnectPending = false
+    if (s.reconnectTimer) { clearTimeout(s.reconnectTimer); s.reconnectTimer = null }
     if (s.bot) s.bot.quit()
     return { ok: true }
   }

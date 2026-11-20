@@ -91,8 +91,8 @@ exports.create = (session, opts) => {
 }
 ```
 
-`assignments.json` 是 `{"登录名": "后端名"}`。匹配不区分大小写。外置认证允许用不同标识登录同一角色时，分配表匹配的是请求中的 `username`。赛事部署应统一使用登记的角色名登录。
+`assignments.json` 是 `{"游戏角色名": "后端名"}`。匹配使用认证适配器返回的 `profile.name`，不区分大小写。
 
-分配表在 bot 子进程启动时读取，文件条目覆盖内联的 `assignments`。没有匹配条目时使用 `server`。修改分配表后，新会话会使用新值。现有会话在原子进程内重连会保持原分配，子进程异常重启时会重新读取，即使客户端还在使用原 token。
+每次登录读取分配表，文件条目覆盖内联的 `assignments`。有效表内没有匹配条目时使用 `server`。分配表无法读取、格式错误、包含大小写重复角色或指向未配置后端时，`/auth/login` 返回 HTTP 503 `routing_unavailable`。会话创建后，普通重连和 bot 子进程恢复均保持该 token 原来的后端。
 
-在 Velocity 注册分配表里的每个后端，并给每个后端配置自己的 RCON。多服模式用目标后端的玩家列表确认 bot 在场。部署时应校验分配 JSON、后端名及 RCON 地址，再原子替换分配文件。适配器的 `server` 字段出现在 `/status.server`，表示目标后端。
+在 Velocity 注册各后端。多服配置要求每个后端有独立的 RCON 地址，并通过 Java 版的 `execute if entity` 逐一确认玩家。RCON 失联时，会话暂缓世界操作，确认恢复后自动恢复就绪。单后端未配置 RCON 时仍可使用基于进度包的判断。部署时原子替换分配文件。`/status.server` 表示目标后端，`/status.readiness_state` 显示确认和世界加载状态。
