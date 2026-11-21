@@ -11,6 +11,7 @@ const mineflayer = require('mineflayer')
 const { Vec3 } = require('vec3')
 const { DEFAULTS, loadConfig } = require('../src/config')
 const { ApiError, Session, api, configure } = require('../src/session')
+const { dispatch } = require('../src/dispatch')
 const web = require('../src/http')
 
 function pathingBot() {
@@ -20,6 +21,44 @@ function pathingBot() {
     pathfinder: { setGoal() {}, goto() { return Promise.resolve() } }
   })
 }
+
+test('chat bypasses the action lock without changing the running action or held keys', async t => {
+  configure({ config: DEFAULTS, createReadiness: () => ({ guardsWorld: true, isReady: () => true }) })
+  const s = new Session('token', 'ChatProbe', { name: 'ChatProbe' }, {})
+  s.bot = { entity: { position: new Vec3(0, 64, 0) }, health: 20, chat: t.mock.fn() }
+  s.worldReady = true
+  const releaseHeld = t.mock.method(s, 'releaseHeld', () => assert.fail('chat released the held keys'))
+  const posture = t.mock.method(s, 'applyPosture', () => {})
+  let finish
+  t.mock.method(api, 'control', () => new Promise(resolve => { finish = resolve }))
+
+  const action = dispatch(s, 'control', { stop_on: ['hurt'] })
+  const lock = s.busy
+  const stopOn = s.activeStopOn
+  assert.equal(lock.name, 'control')
+  assert.equal((await dispatch(s, 'control', {})).body.error.code, 'busy')
+  assert.deepEqual((await dispatch(s, 'chat', { message: 'Working' })).body.result, { sent: true })
+  assert.equal((await dispatch(s, 'chat', { message: 'Still working' })).body.error.code, 'rate_limited')
+  assert.equal(s.busy, lock)
+  assert.equal(s.activeStopOn, stopOn)
+  assert.equal(s.interruptedBy, null)
+  assert.equal(posture.mock.callCount(), 0)
+  finish({ controlled: true })
+  assert.deepEqual((await action).body.result, { controlled: true })
+
+  const held = { keys: ['sneak'] }
+  s.heldControl = held
+  s.lastChatAt = Date.now() - 1000
+  s.bot.chat.mock.mockImplementation(() => assert.equal(s.busy, null))
+  assert.equal((await dispatch(s, 'chat', { message: '/' })).body.error.code, 'bad_args')
+  assert.deepEqual((await dispatch(s, 'chat', { message: 'Holding sneak' })).body.result, { sent: true })
+  assert.equal(s.heldControl, held)
+  assert.equal(releaseHeld.mock.callCount(), 0)
+  assert.equal(posture.mock.callCount(), 1)
+  s.alive = false
+  assert.equal((await dispatch(s, 'chat', { message: 'Dead' })).body.error.code, 'dead')
+  assert.equal(s.bot.chat.mock.callCount(), 2)
+})
 
 test('keep the teleport ID guard when the protocol packet table is unavailable', t => {
   const write = t.mock.fn()

@@ -18,18 +18,20 @@ function readinessError (session) {
 // 返回 { status, body }：status 是 HTTP 状态码，body 是响应 JSON
 async function dispatch (session, name, args) {
   if (!Object.hasOwn(api, name)) return { status: 404, body: { ok: false, error: { code: 'unknown_api', path: name } } }
-  const isAction = !READONLY.has(name)
+  const locksAction = name !== 'chat' && !READONLY.has(name)
+  const requiresAlive = locksAction || name === 'chat'
   const b = session.bot
-  if ((isAction || (session.readiness.guardsWorld && PROXY_WORLD_ENDPOINTS.has(name))) && !session.isReady()) {
+  if ((requiresAlive || (session.readiness.guardsWorld && PROXY_WORLD_ENDPOINTS.has(name))) && !session.isReady()) {
     return { status: 200, body: { ok: false, error: readinessError(session) } }
   }
   if (NEED_WORLD.has(name) && b && !(b.entity && b.world && typeof b.blockAt === 'function' && b.inventory)) {
     return { status: 200, body: { ok: false, error: { code: 'not_ready', message: 'bot is (re)connecting, world not loaded yet; retry in a moment' } } }
   }
 
-  // Action guards
-  if (isAction) {
-    if (!session.alive) return { status: 200, body: { ok: false, error: { code: 'dead', message: 'bot is dead, waiting for respawn' } } }
+  if (requiresAlive && !session.alive) {
+    return { status: 200, body: { ok: false, error: { code: 'dead', message: 'bot is dead, waiting for respawn' } } }
+  }
+  if (locksAction) {
     if (session.busy) return { status: 200, body: { ok: false, error: { code: 'busy', message: `running ${session.busy.name}` } } }
     session.busy = { name, t: Date.now() }
     // 其它动作开始前先松开 control wait:false 留下的按键（control 自己会处理）
@@ -41,10 +43,10 @@ async function dispatch (session, name, args) {
 
   const t0 = Date.now()
   try {
-    const protectAction = session.readiness.guardsWorld && (isAction || name === 'look' || name === 'posture')
+    const protectAction = session.readiness.guardsWorld && (requiresAlive || name === 'look' || name === 'posture')
     const invoke = () => api[name](session, args)
     const result = await (protectAction ? session.withBackendAction(invoke) : invoke())
-    if (isAction && session.interruptedBy) {
+    if (locksAction && session.interruptedBy) {
       if (session.interruptedBy === 'server_changed') throw new ApiError('interrupted', 'target server verification was lost', { cause: 'server_changed' })
       if (session.interruptedBy !== 'death' && result && Object.keys(result).length) result.interrupted_by = session.interruptedBy
       else throw new ApiError(session.interruptedBy === 'death' ? 'dead' : 'interrupted', `stopped because of ${session.interruptedBy}`)
@@ -54,9 +56,9 @@ async function dispatch (session, name, args) {
   } catch (e) {
     // 动作进行中 bot 被 /disconnect、踢出或断线：s.bot 变成 null，动作里随后的属性访问会抛 TypeError，
     // 以前报成 internal "Cannot read properties of null (reading 'pathfinder')"
-    if (isAction && !session.bot && !e.code) e = new ApiError('not_connected', `bot disconnected while ${name} was running`)
-    if (isAction && session.interruptedBy !== 'server_changed' && session.bot && (!session.alive || session.bot.health <= 0)) session.interruptedBy = 'death'
-    if (isAction && session.interruptedBy && !['interrupted', 'dead'].includes(e.code)) {
+    if (locksAction && !session.bot && !e.code) e = new ApiError('not_connected', `bot disconnected while ${name} was running`)
+    if (locksAction && session.interruptedBy !== 'server_changed' && session.bot && (!session.alive || session.bot.health <= 0)) session.interruptedBy = 'death'
+    if (locksAction && session.interruptedBy && !['interrupted', 'dead'].includes(e.code)) {
       const inner = e
       e = new ApiError(session.interruptedBy === 'death' ? 'dead' : 'interrupted', `stopped because of ${session.interruptedBy} (${inner.message})`)
       e.extra = { ...(inner.extra || {}), ...(inner.code ? { inner_code: inner.code } : {}) }
@@ -65,7 +67,7 @@ async function dispatch (session, name, args) {
     session.log('API', name, 'FAIL', e.code || 'internal', e.message)
     return { status: 200, body: { ok: false, ms: Date.now() - t0, error: { code: e.code || 'internal', message: e.message, ...(e.extra || {}) } } }
   } finally {
-    if (isAction) { session.busy = null; session.activeStopOn = null; session.applyPosture() }
+    if (locksAction) { session.busy = null; session.activeStopOn = null; session.applyPosture() }
   }
 }
 

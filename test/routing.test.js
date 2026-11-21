@@ -129,7 +129,7 @@ test('proxy gates world observations and lock-free gameplay, and filters wrong-w
   })
   const s = new Session('token', 'alias', { name: 'Agent_1' }, {})
   s.bot = { entity: { position: { x: 999 } } }
-  for (const endpoint of ['get_block', 'find_blocks', 'get_entities', 'inventory', 'advancements', 'look', 'posture', 'control']) {
+  for (const endpoint of ['get_block', 'find_blocks', 'get_entities', 'inventory', 'advancements', 'look', 'posture', 'control', 'chat']) {
     const r = await dispatch(s, endpoint, {})
     assert.equal(r.body.error.code, 'backend_unavailable', endpoint)
   }
