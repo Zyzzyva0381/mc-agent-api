@@ -6,6 +6,7 @@ const { pathfinder, Movements, goals } = require('mineflayer-pathfinder')
 const { Vec3 } = require('vec3')
 const { AsyncLocalStorage } = require('node:async_hooks')
 const { createMotionTracker } = require('./motion')
+const { installMovementCompatibility } = require('./movement-compat')
 
 const sleep = ms => new Promise(r => setTimeout(r, ms))
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a)
@@ -206,6 +207,7 @@ class Session {
     })
     const worldBot = s.bot
     worldBot.loadPlugin(pathfinder)
+    worldBot.once('inject_allowed', () => installMovementCompatibility(worldBot))
     // mineflayer 回显 accepts teleport 用的 teleportId 来自它最后看到的 position 包。
     // Velocity 切后端（play -> configuration -> play）时会漏出一个没有 teleportId 的
     // position 事件，protodef 对 undefined 字段直接跳过，于是序列化出一个"空 body"的
