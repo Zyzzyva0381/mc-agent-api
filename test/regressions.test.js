@@ -40,6 +40,30 @@ test('keep the teleport ID guard when the protocol packet table is unavailable',
   assert.equal(session.nearestHostile(24), null)
 })
 
+test('repeated deaths preserve the session and emit the usual death events', async t => {
+  const client = Object.assign(new EventEmitter(), { state: 'play', write() {} })
+  const bot = Object.assign(pathingBot(), {
+    version: 'unavailable-test-version',
+    _client: client,
+    loadPlugin() {},
+    quit: t.mock.fn()
+  })
+  t.mock.method(mineflayer, 'createBot', () => bot)
+  configure({ config: DEFAULTS, createReadiness: () => ({ attach() {} }) })
+  const session = new Session('test', 'DeathProbe', { name: 'DeathProbe' }, {})
+  session.connect()
+  for (let i = 0; i < 4; i++) {
+    session.alive = true
+    bot.emit('death')
+    assert.equal(session.alive, false)
+    assert.equal(session.bot, bot)
+  }
+  assert.equal(bot.quit.mock.callCount(), 0)
+  assert.deepEqual(session.events.map(event => event.type), ['death', 'death', 'death', 'death'])
+  session.bot = null
+  assert.deepEqual(await api.connect(session), { ok: true, reconnect: true })
+})
+
 test('disconnect aborts pending pathfinding and cleans up the original bot', { timeout: 1000 }, async () => {
   for (const y of [undefined, 64]) {
     const bot = pathingBot()

@@ -115,7 +115,7 @@ Authorization: Bearer <token>
 POST /connect
 ```
 
-`result`：`{"ok": true}`；已在线时 `{"ok": true, "already_connected": true}`。断线重连需间隔 ≥ 30 秒，死亡循环冷却期间返回 `death_loop_cooldown`（附 `cooldown_remaining_seconds`）。
+`result`：`{"ok": true}`；已在线时 `{"ok": true, "already_connected": true}`。bot 死亡后会自动重生，客户端可轮询 `/status` 等待就绪。
 
 `status.ready` 由部署方配置的就绪适配器和世界加载状态共同决定。内置代理适配器按认证角色名为每个 token 固定后端，`status.server` 显示目标。切服或确认中断期间，`/status` 只返回连接信息。坐标、背包、方块和进度等数据在目标世界就绪后提供。配置说明见 `docs/ADAPTERS.md`。
 
@@ -342,7 +342,6 @@ POST /events  {"since": 41, "limit": 50}
 | `sleep` / `wake` | 无 |
 | `vehicle` | `action`（`mount`/`dismount`）、`name` |
 | `kicked` / `disconnected` | `reason` |
-| `death_loop` | `deaths`、`cooldown_until` |
 | `server_confirmed` | `via`（以及适配器给出的 `server` 等） |
 
 ### 3.7 进度
@@ -797,7 +796,6 @@ POST /stop
 | `wrong_server` | 还没就绪（不在目标服务器上） |
 | `backend_unavailable` | 暂时无法确认 bot 在目标服务器，等待后端确认恢复 |
 | `not_ready` | 数据（如进度）还没下发；或登录 / 重生 / 切维度后世界还在加载（稍等重试） |
-| `death_loop_cooldown` | 死亡循环保护中 |
 | `busy` | 有动作正在执行 |
 | `dead` | 已死亡，等待重生 |
 | `interrupted` | 动作被打断（附 `cause`：`stop` / `hurt` / …，以及 `nearest_hostile`、`inner_code`） |
@@ -938,13 +936,12 @@ curl -s -X POST http://127.0.0.1:18900/api/v1/posture \
 
 ## 7. 注意事项
 
-1. **死亡循环保护**：60 秒内死亡 3 次，bot 自动下线 5 分钟。
-2. **动作互斥**：一次一个动作，重复调用返回 `busy`。
-3. **重连间隔**：断开后至少 30 秒。
-4. **方块探测**：只返回暴露方块，无矿透。
-5. **战斗**：不提供自动反击，被打断时返回 `nearest_hostile` 供决策。
-6. **配方**：未解锁配方的合成会慢一些。
-7. **已知限制**：
+1. **动作互斥**：一次一个动作，重复调用返回 `busy`。
+2. **重连间隔**：断开后至少 30 秒。
+3. **方块探测**：只返回暴露方块，无矿透。
+4. **战斗**：不提供自动反击，被打断时返回 `nearest_hostile` 供决策。
+5. **配方**：未解锁配方的合成会慢一些。
+6. **已知限制**：
    - `move_to` 走寻路：卡在实体碰撞箱（例如站在船顶）或未加载区块上时，8 秒没位移就会报 `stalled` 而不是一直占着动作锁；这时用 `/control` 的 200ms 方向键或 `jump` 自救；
    - 在水里做 `move_to` 时，默认 `stop_on` 含 `hurt`，溺水扣血会打断上浮；要么先 `POST /posture {"jump": true}` 浮起来，要么显式传 `"stop_on": []`；
    - 载具掌舵只能"朝目标直线开"，不会绕障；撞上地形会一直顶住直到超时（`drive_timeout`）；
@@ -957,6 +954,7 @@ curl -s -X POST http://127.0.0.1:18900/api/v1/posture \
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 1.3.17 | 2026-11-21 | 关闭死亡循环保护，连续死亡后保留会话并自动重生 |
 | 1.3.16 | 2026-11-20 | 按认证角色固定分配；分配表异常暂停新登录；切服和确认中断期间暂停世界接口，RCON 恢复后同一会话继续 |
 | 1.3.15 | 2026-11-20 | 支持按角色分配代理后端，`/status.server` 显示目标；修复 Velocity 切服后世界就绪状态未恢复，以及断线时动作报错；限制 HTTP 请求体为 1 MiB |
 | 1.3.14 | 2026-11-16 | 新增 `/control` `"wait": false`（实时操控）：按下就返回（服务端约 1 ms，以前要等满 `ms`），键在后台按住 `ms` 后松开，下一个 `/control` 立刻接管；`{"wait": false}` 空调用立即松开；`/status` 新增 `held_controls` |

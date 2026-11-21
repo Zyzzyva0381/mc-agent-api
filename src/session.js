@@ -47,12 +47,10 @@ class Session {
     this.busy = null
     this.alive = true
     this.lastDeath = null
-    this.deathLoopCooldownUntil = 0
     this.activeStopOn = null
     this.interruptedBy = null
     this.events = []
     this.seq = 0
-    this.recentDeaths = []
     this.advancementDefinitions = new Map()
     this.advancementProgress = new Map()
     this.advancementsReady = false
@@ -509,25 +507,12 @@ class Session {
       if (s.lastDeath && !s.lastDeath.cause && Date.now() - s.lastDeath.t < 3000 && text.startsWith(s.bot.username + ' ')) s.lastDeath.cause = text
       s.pushEvent('chat', { text: text.slice(0, 300) })
     })
-    const DEATH_LOOP_WINDOW = 60000
-    const DEATH_LOOP_THRESHOLD = 3
-    const DEATH_LOOP_COOLDOWN = 5 * 60 * 1000
     s.bot.on('death', () => {
       s.alive = false
       if (s.readiness.guardsWorld && !s.readiness.isReady()) return
       s.lastDeath = { pos: fmt(s.bot.entity.position), t: Date.now(), dropped_items_at: fmt(s.bot.entity.position) }
       s.pushEvent('death', s.lastDeath); s.releaseHeld(); s.interrupt('death')
       s.clearPosture()
-      const now = Date.now()
-      s.recentDeaths.push(now)
-      while (s.recentDeaths.length && s.recentDeaths[0] < now - DEATH_LOOP_WINDOW) s.recentDeaths.shift()
-      if (s.recentDeaths.length >= DEATH_LOOP_THRESHOLD) {
-        s.log('DEATH_LOOP detected:', s.recentDeaths.length, 'deaths in', DEATH_LOOP_WINDOW / 1000, 's')
-        s.deathLoopCooldownUntil = now + DEATH_LOOP_COOLDOWN
-        s.pushEvent('death_loop', { deaths: s.recentDeaths.length, cooldown_until: s.deathLoopCooldownUntil })
-        s.recentDeaths.length = 0
-        s.bot.quit('death loop protection')
-      }
     })
     s.bot.on('spawn', () => { s.alive = true })
     let lastHealth
@@ -3046,10 +3031,6 @@ const api = {
         return { ok: true, already_connected: true, ready: false, ...(extra || {}) }
       }
       return { ok: true, already_connected: true, ready: true }
-    }
-    if (Date.now() < s.deathLoopCooldownUntil) {
-      const remaining = Math.ceil((s.deathLoopCooldownUntil - Date.now()) / 1000)
-      fail('death_loop_cooldown', `bot is in death loop cooldown, ${remaining}s remaining`)
     }
     s.connect()
     return { ok: true, reconnect: true }
