@@ -145,4 +145,37 @@ test('attack rejects invalid chase, feedback, and timeout arguments with bad_arg
     () => api.attack(s, { entity_id: 42, chase: false, timeout: Number.NaN }),
     err => err && err.code === 'bad_args',
   )
+  await assert.rejects(
+    () => api.attack(s, { entity_id: 42, chase: false, timeout: '500' }),
+    err => err && err.code === 'bad_args',
+  )
+  await assert.rejects(
+    () => api.attack(s, { entity_id: 42, chase: false, timeout: null }),
+    err => err && err.code === 'bad_args',
+  )
+})
+
+test('attack does not falsely flag a wall behind the target hitbox as occluded', async () => {
+  // Target stands at x=2.0 (AABB x in [1.7, 2.3]); wall behind target is at x=2.5
+  const { s, getAttacks } = makeSession({
+    targetPos: new Vec3(2.0, 64, 0),
+    blockAtCursor: () => ({ name: 'stone', boundingBox: 'block', position: new Vec3(2, 65, 0), intersect: new Vec3(2.5, 65.58, 0) }),
+  })
+  const res = await api.attack(s, { entity_id: 42, max_hits: 1, interval_ms: 50, chase: false, feedback: true })
+  assert.equal(getAttacks(), 1)
+  assert.equal(res.hits, 1)
+  assert.equal(res.stop_reason, 'max_hits')
+  assert.equal(res.hit_log[0].occluded, undefined)
+})
+
+test('attack stops cleanly without phantom swing if target vanishes during lookAt', async () => {
+  const { s, bot, getAttacks, events } = makeSession({ targetPos: new Vec3(1.8, 64, 0) })
+  bot.lookAt = async () => { delete bot.entities[42] }
+  const res = await api.attack(s, { entity_id: 42, max_hits: 1, chase: false, feedback: true })
+  assert.equal(getAttacks(), 0)
+  assert.equal(res.hits, 0)
+  assert.equal(res.killed, true)
+  assert.equal(res.stop_reason, 'killed')
+  assert.equal(res.hit_log.length, 0)
+  assert.equal(events.filter(e => e.type === 'attack_hit').length, 0)
 })

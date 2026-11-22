@@ -342,6 +342,7 @@ POST /events  {"since": 41, "limit": 50}
 | `sleep` / `wake` | 无 |
 | `vehicle` | `action`（`mount`/`dismount`）、`name` |
 | `kicked` / `disconnected` | `reason` |
+| `attack_hit` | `hit`、`t_ms`、`entity_id`、`dist`、`target_pos`、`bot_hp`、可选 `occluded`（仅 `/attack` 传 `feedback: true` 时推送） |
 | `server_confirmed` | `via`（以及适配器给出的 `server` 等） |
 
 ### 3.7 进度

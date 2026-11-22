@@ -2343,8 +2343,8 @@ const api = {
     if (interval_ms !== undefined && (!Number.isFinite(interval_ms) || interval_ms < 50 || interval_ms > 5000)) fail('bad_args', 'interval_ms must be between 50 and 5000')
     if (typeof chase !== 'boolean') fail('bad_args', 'chase must be a boolean')
     if (typeof feedback !== 'boolean') fail('bad_args', 'feedback must be a boolean')
-    const effTimeout = timeout === undefined ? (chase ? 20000 : 1500) : Number(timeout)
-    if (!Number.isFinite(effTimeout) || effTimeout < 50 || effTimeout > 60000) fail('bad_args', 'timeout must be between 50 and 60000')
+    if (timeout !== undefined && (!Number.isFinite(timeout) || timeout < 50 || timeout > 60000)) fail('bad_args', 'timeout must be between 50 and 60000')
+    const effTimeout = timeout === undefined ? (chase ? 20000 : 1500) : timeout
     const weapon = bot.inventory.items().filter(i => /_sword$|_axe$/.test(i.name)).sort((a, b) => (b.name.includes('sword') - a.name.includes('sword')))[0]
     if (weapon) await bot.equip(weapon, 'hand')
     requireConnected(s, bot)
@@ -2362,28 +2362,33 @@ const api = {
           const entityHeight = e.height || 1.8
           const halfWidth = (e.width || 0.6) * 0.5
           const eye = bot.entity.position.offset(0, bot.entity.eyeHeight || 1.62, 0)
-          const isBlocked = (blk, aimDist) => !!(
-            blk && blk.intersect && blk.boundingBox !== 'empty'
-            && eye.distanceTo(blk.intersect) < Math.max(0.2, aimDist - halfWidth)
-          )
+          const isBlocked = (blk, aim, aimDist) => {
+            if (!blk || !blk.intersect || blk.boundingBox === 'empty') return false
+            const dir = aimDist > 1e-6 ? aim.minus(eye).scaled(1 / aimDist) : null
+            const boxT = dir ? rayBox(eye, dir, e.position.offset(-halfWidth, 0, -halfWidth), e.position.offset(halfWidth, entityHeight, halfWidth)) : null
+            const reachLimit = boxT !== null ? boxT : Math.max(0, aimDist - halfWidth)
+            return eye.distanceTo(blk.intersect) < reachLimit - 1e-3
+          }
           const upperAim = e.position.offset(0, entityHeight * 0.8, 0)
           await bot.lookAt(upperAim, true)
           requireConnected(s, bot)
+          if (!bot.entities[entity_id] || !e.isValid || s.interruptedBy) break
           let occluded = false
           if (!chase || feedback) {
             const upperDist = eye.distanceTo(upperAim)
             const upperBlk = typeof bot.blockAtCursor === 'function' ? bot.blockAtCursor(upperDist) : null
-            if (isBlocked(upperBlk, upperDist)) {
+            if (isBlocked(upperBlk, upperAim, upperDist)) {
               const midAim = e.position.offset(0, entityHeight * 0.5, 0)
               await bot.lookAt(midAim, true)
               requireConnected(s, bot)
+              if (!bot.entities[entity_id] || !e.isValid || s.interruptedBy) break
               const midDist = eye.distanceTo(midAim)
               const midBlk = typeof bot.blockAtCursor === 'function' ? bot.blockAtCursor(midDist) : null
-              if (isBlocked(midBlk, midDist)) {
+              if (isBlocked(midBlk, midAim, midDist)) {
                 occluded = true
                 if (!chase) {
                   const blk = midBlk || upperBlk
-                  blocking_block = { name: blk.name, pos: [blk.position.x, blk.position.y, blk.position.z] }
+                  blocking_block = { name: blk.name, pos: blk.position ? [blk.position.x, blk.position.y, blk.position.z] : null }
                   stop_reason = 'blocked_by_wall'
                   break
                 }
@@ -2392,11 +2397,12 @@ const api = {
           }
           bot.attack(e); hits++
           if (feedback) {
+            const hitDist = e.position.distanceTo(bot.entity.position)
             const rec = {
               hit: hits,
               t_ms: Date.now() - t0,
               entity_id: e.id ?? entity_id,
-              dist: +dist.toFixed(2),
+              dist: +hitDist.toFixed(2),
               target_pos: [+e.position.x.toFixed(2), +e.position.y.toFixed(2), +e.position.z.toFixed(2)],
               bot_hp: bot.health !== undefined ? +bot.health.toFixed(1) : null,
               ...(occluded ? { occluded: true } : {}),
