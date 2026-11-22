@@ -2359,22 +2359,35 @@ const api = {
         requireConnected(s, bot)
         const dist = e.position.distanceTo(bot.entity.position)
         if (dist < 3.2) {
-          await bot.lookAt(e.position.offset(0, (e.height || 1.8) * 0.8, 0), true)
+          const entityHeight = e.height || 1.8
+          const halfWidth = (e.width || 0.6) * 0.5
+          const eye = bot.entity.position.offset(0, bot.entity.eyeHeight || 1.62, 0)
+          const isBlocked = (blk, aimDist) => !!(
+            blk && blk.intersect && blk.boundingBox !== 'empty'
+            && eye.distanceTo(blk.intersect) < Math.max(0.2, aimDist - halfWidth)
+          )
+          const upperAim = e.position.offset(0, entityHeight * 0.8, 0)
+          await bot.lookAt(upperAim, true)
           requireConnected(s, bot)
           let occluded = false
           if (!chase || feedback) {
-            const targetCenter = e.position.offset(0, (e.height || 1.8) * 0.5, 0)
-            const eye = bot.entity.position.offset(0, bot.entity.eyeHeight || 1.62, 0)
-            const eyeDist = eye.distanceTo(targetCenter)
-            const blk = typeof bot.blockAtCursor === 'function' ? bot.blockAtCursor(eyeDist) : null
-            occluded = !!(
-              blk && blk.intersect && blk.boundingBox !== 'empty'
-              && eye.distanceTo(blk.intersect) < Math.max(0.2, eyeDist - (e.width || 0.6) * 0.5)
-            )
-            if (occluded && !chase) {
-              blocking_block = { name: blk.name, pos: [blk.position.x, blk.position.y, blk.position.z] }
-              stop_reason = 'blocked_by_wall'
-              break
+            const upperDist = eye.distanceTo(upperAim)
+            const upperBlk = typeof bot.blockAtCursor === 'function' ? bot.blockAtCursor(upperDist) : null
+            if (isBlocked(upperBlk, upperDist)) {
+              const midAim = e.position.offset(0, entityHeight * 0.5, 0)
+              await bot.lookAt(midAim, true)
+              requireConnected(s, bot)
+              const midDist = eye.distanceTo(midAim)
+              const midBlk = typeof bot.blockAtCursor === 'function' ? bot.blockAtCursor(midDist) : null
+              if (isBlocked(midBlk, midDist)) {
+                occluded = true
+                if (!chase) {
+                  const blk = midBlk || upperBlk
+                  blocking_block = { name: blk.name, pos: [blk.position.x, blk.position.y, blk.position.z] }
+                  stop_reason = 'blocked_by_wall'
+                  break
+                }
+              }
             }
           }
           bot.attack(e); hits++

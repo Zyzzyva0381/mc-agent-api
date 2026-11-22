@@ -9,6 +9,8 @@ function makeSession({ targetPos, blockAtCursor = () => null }) {
   let goalCalls = 0
   let attacks = 0
   const events = []
+  const lookTargets = []
+  const cursorDists = []
   const bot = {
     health: 18.4,
     heldItem: { name: 'iron_sword' },
@@ -18,9 +20,12 @@ function makeSession({ targetPos, blockAtCursor = () => null }) {
     },
     inventory: { items: () => [{ name: 'iron_sword', count: 1 }] },
     equip: async () => {},
-    lookAt: async () => {},
+    lookAt: async (pos) => { lookTargets.push(pos.clone()) },
     attack: () => { attacks++ },
-    blockAtCursor,
+    blockAtCursor: (maxDist) => {
+      cursorDists.push(maxDist)
+      return blockAtCursor(maxDist, lookTargets[lookTargets.length - 1])
+    },
     pathfinder: { setGoal: () => { goalCalls++ } },
   }
   const s = {
@@ -28,7 +33,7 @@ function makeSession({ targetPos, blockAtCursor = () => null }) {
     interruptedBy: null,
     pushEvent: (type, data) => events.push({ type, data }),
   }
-  return { s, bot, getGoalCalls: () => goalCalls, getAttacks: () => attacks, events }
+  return { s, bot, getGoalCalls: () => goalCalls, getAttacks: () => attacks, events, lookTargets, cursorDists }
 }
 
 test('attack with chase=false and feedback=true stands ground, records hit_log, and emits attack_hit', async () => {
@@ -76,4 +81,68 @@ test('legacy attack call without chase/feedback preserves exact legacy response 
   assert.equal(res.hit_log, undefined)
   assert.equal(res.stop_reason, undefined)
   assert.equal(events.filter(e => e.type === 'attack_hit').length, 0)
+})
+
+test('attack falls back to 0.5-height ray when 0.8-height ray is occluded and aligns aim/distance', async () => {
+  const targetPos = new Vec3(2.2, 64, 0)
+  const eye = new Vec3(0, 65.62, 0)
+  const { s, getAttacks, lookTargets, cursorDists } = makeSession({
+    targetPos,
+    blockAtCursor: (_maxDist, aim) => {
+      // Only block the upper (0.8 * height) ray, leaving mid (0.5 * height) clear
+      if (aim && aim.y > 65.3) {
+        return { name: 'stone_slab', boundingBox: 'block', position: new Vec3(1, 65, 0), intersect: new Vec3(1.0, 65.58, 0) }
+      }
+      return null
+    },
+  })
+  const res = await api.attack(s, { entity_id: 42, max_hits: 1, interval_ms: 50, chase: false, feedback: true })
+  assert.equal(getAttacks(), 1)
+  assert.equal(res.hits, 1)
+  assert.equal(res.stop_reason, 'max_hits')
+  assert.equal(res.hit_log[0].occluded, undefined)
+  assert.equal(lookTargets.length, 2)
+  assert.equal(cursorDists.length, 2)
+  assert.ok(Math.abs(cursorDists[0] - eye.distanceTo(lookTargets[0])) < 1e-6)
+  assert.ok(Math.abs(cursorDists[1] - eye.distanceTo(lookTargets[1])) < 1e-6)
+})
+
+test('attack with chase=true and feedback=true keeps GoalFollow and records occluded swing receipts', async () => {
+  const { s, getGoalCalls, getAttacks, events } = makeSession({
+    targetPos: new Vec3(2.2, 64, 0),
+    blockAtCursor: () => ({ name: 'stone', boundingBox: 'block', position: new Vec3(1, 65, 0), intersect: new Vec3(1.0, 65.62, 0) }),
+  })
+  const res = await api.attack(s, { entity_id: 42, max_hits: 1, interval_ms: 50, chase: true, feedback: true })
+  assert.equal(getGoalCalls(), 2)
+  assert.equal(getAttacks(), 1)
+  assert.equal(res.hits, 1)
+  assert.equal(res.stop_reason, 'max_hits')
+  assert.equal(res.hit_log.length, 1)
+  assert.equal(res.hit_log[0].occluded, true)
+  assert.equal(events.filter(e => e.type === 'attack_hit').length, 1)
+  assert.equal(events[0].data.occluded, true)
+})
+
+test('attack rejects invalid chase, feedback, and timeout arguments with bad_args', async () => {
+  const { s } = makeSession({ targetPos: new Vec3(1.8, 64, 0) })
+  await assert.rejects(
+    () => api.attack(s, { entity_id: 42, chase: 'false' }),
+    err => err && err.code === 'bad_args',
+  )
+  await assert.rejects(
+    () => api.attack(s, { entity_id: 42, feedback: 1 }),
+    err => err && err.code === 'bad_args',
+  )
+  await assert.rejects(
+    () => api.attack(s, { entity_id: 42, chase: false, timeout: 10 }),
+    err => err && err.code === 'bad_args',
+  )
+  await assert.rejects(
+    () => api.attack(s, { entity_id: 42, chase: false, timeout: 99999 }),
+    err => err && err.code === 'bad_args',
+  )
+  await assert.rejects(
+    () => api.attack(s, { entity_id: 42, chase: false, timeout: Number.NaN }),
+    err => err && err.code === 'bad_args',
+  )
 })

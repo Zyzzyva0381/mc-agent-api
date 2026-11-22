@@ -523,8 +523,8 @@ POST /attack  {"entity_id": 812, "max_hits": 5, "interval_ms": 300}
 - 挥击间隔默认按手持物品的原版攻速计算：空手和非工具物品 250ms、剑 625ms、镐 833ms、锹 1000ms、斧 1000–1250ms、锄 250–1000ms（按材质）、三叉戟 909ms、重锤 1667ms（空手拆船/拆矿车需要 250ms，固定 650ms 会被船的每 tick 自愈抵消）；
 - `max_hits`：打够这么多下立刻返回，用于"砍一下就走"（风筝苦力怕、单次敲击）；
 - `interval_ms`：手动覆盖挥击间隔（50–5000）；
-- `chase`（默认 `true`）：设为 `false` 时**原地站桩面向目标挥击**，不启动 `GoalFollow` 寻路追击（适合 1×2 窄矿道、门洞贴脸防身）；未传 `timeout` 时默认守点窗口 `1500ms`（可按需传入 `timeout` 如 `1000`–`5000`ms 等待怪物走进射程），被墙遮挡或窗口结束仍够不到时返回 `stop_reason`（`blocked_by_wall` / `out_of_reach`）；
-- `feedback`（默认 `false`）：设为 `true` 时在返回体中附带逐次挥击回执 `hit_log`（含 `hit`、`t_ms`、`entity_id`、`dist`、`target_pos`、`bot_hp`）和 `stop_reason`，同时推送 `attack_hit` 事件供 `/events` 实时观测；默认 `false` 时保持与旧版完全一致的返回格式和事件流。
+- `chase`（默认 `true`）：设为 `false` 时**原地站桩面向目标挥击**，不启动 `GoalFollow` 寻路追击，击杀后也**不会自动移动捡掉落物**（适合 1×2 窄矿道、门洞贴脸防身）；未传 `timeout` 时默认守点窗口 `1500ms`（可按需传入 `timeout` 范围 `50`–`60000`ms 等待怪物走进射程）；若校验目标 `0.8` 高度与 `0.5` 高度两条射线均被实心方块遮挡，会**立即返回 `blocked_by_wall`**（不继续等待 `timeout` 窗口），窗口结束仍够不到时返回 `out_of_reach`；
+- `feedback`（默认 `false`）：设为 `true` 时在返回体中附带逐次挥击回执 `hit_log`（含 `hit`、`t_ms`、`entity_id`、`dist`、`target_pos`、`bot_hp`，遮挡时附带 `occluded: true`）和 `stop_reason`，同时推送 `attack_hit` 事件供 `/events` 实时观测；注意 `hit_log` / `attack_hit` 记录的是**客户端发起挥击回执**而非服务端伤害确认（`chase: true, feedback: true` 且目标被遮挡时，仍会按原版逻辑发起挥击并记录带 `occluded: true` 的回执）；默认 `false` 时保持与旧版完全一致的返回格式和事件流。
 
 `/attack` 会自动寻路贴近、自动瞄准、自动换上剑/斧。需要自己控制方向、站位和节奏（跳劈暴击、隔缝挥砍、朝固定方向打）时，改用 `POST /control {"hit": ...}`，见 §4.16。
 
