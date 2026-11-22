@@ -408,6 +408,8 @@ class Session {
     s.bot.once('spawn', () => {
       s.bot.physics.playerHalfWidth = 0.3001
       s.mcData = require('minecraft-data')(s.bot.version)
+      patchBrokenPickaxeMaterials(s.mcData)
+      patchBrokenPickaxeMaterials(s.bot.registry)
       const m = new Movements(s.bot)
       m.canDig = false
       m.allow1by1towers = false
@@ -3045,7 +3047,30 @@ const api = {
   }
 }
 
+// minecraft-data 1.21.11 tags 108 pickaxe blocks (obsidian, ancient_debris, ores, etc.)
+// with material='incorrect_for_wooden_tool', whose tool-speed map lacks stone/iron/diamond/netherite
+// pickaxes. Mineflayer therefore computes hand-speed digTime (e.g. 75s for obsidian -> 30s timeout,
+// 45s for ancient_debris -> 30s timeout, 6.75s for deepslate ores). Restore 'mineable/pickaxe'.
+function patchBrokenPickaxeMaterials(reg) {
+  if (!reg || !reg.materials || !reg.materials['mineable/pickaxe']) return 0
+  let patched = 0
+  const seen = new Set()
+  for (const list of [reg.blocksByName, reg.blocks, reg.blocksArray]) {
+    if (!list) continue
+    const vals = Array.isArray(list) ? list : Object.values(list)
+    for (const b of vals) {
+      if (!b || seen.has(b)) continue
+      seen.add(b)
+      if (typeof b.material === 'string' && b.material.startsWith('incorrect_for_')) {
+        b.material = 'mineable/pickaxe'
+        patched++
+      }
+    }
+  }
+  return patched
+}
+
 // window_view 会走路并打开界面，要占动作锁，所以不放进只读集合
 const READONLY = new Set(['status', 'inventory', 'find_blocks', 'get_entities', 'events', 'advancements', 'get_block', 'stop', 'connect', 'disconnect', 'posture', 'look'])
 
-module.exports = { configure, Session, sessions, api, READONLY, ApiError, fail, fmt, log, sleep }
+module.exports = { configure, Session, sessions, api, READONLY, ApiError, fail, fmt, log, sleep, patchBrokenPickaxeMaterials }
