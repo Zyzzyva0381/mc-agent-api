@@ -2334,36 +2334,115 @@ const api = {
     }
   },
   // 攻击：按手持物品的原版攻速挥击（空手 250ms、剑 625ms、斧 1000ms…），
-  // max_hits 用于"打一下就走"（风筝苦力怕、单次敲船/矿车）。
-  async attack(s, { entity_id, timeout = 20000, max_hits, interval_ms }) {
+  // max_hits 用于"打一下就走"（风筝苦力怕、单次敲船/矿车）；
+  // chase=false 用于原地站桩挥击（1x2 窄矿道/门洞近战防身，不开 GoalFollow 乱跑）；
+  // feedback=true 开启逐次挥击回执 hit_log、stop_reason 与 attack_hit 事件（默认 false 保持旧版返回完全兼容）。
+  async attack(s, { entity_id, timeout, max_hits, interval_ms, chase = true, feedback = false }) {
     const bot = requireConnected(s)
     const e = bot.entities[entity_id]
     if (!e) fail('no_such_entity', `entity ${entity_id} not visible`)
     if (max_hits !== undefined && (!Number.isInteger(max_hits) || max_hits < 1)) fail('bad_args', 'max_hits must be a positive integer')
     if (interval_ms !== undefined && (!Number.isFinite(interval_ms) || interval_ms < 50 || interval_ms > 5000)) fail('bad_args', 'interval_ms must be between 50 and 5000')
+    if (typeof chase !== 'boolean') fail('bad_args', 'chase must be a boolean')
+    if (typeof feedback !== 'boolean') fail('bad_args', 'feedback must be a boolean')
+    if (timeout !== undefined && (!Number.isFinite(timeout) || timeout < 50 || timeout > 60000)) fail('bad_args', 'timeout must be between 50 and 60000')
+    const effTimeout = timeout === undefined ? (chase ? 20000 : 1500) : timeout
     const weapon = bot.inventory.items().filter(i => /_sword$|_axe$/.test(i.name)).sort((a, b) => (b.name.includes('sword') - a.name.includes('sword')))[0]
     if (weapon) await bot.equip(weapon, 'hand')
     requireConnected(s, bot)
     const interval = interval_ms ?? attackIntervalMs(bot.heldItem)
     const t0 = Date.now(); let hits = 0
-    bot.pathfinder.setGoal(new goals.GoalFollow(e, 1.5), true)
+    const hit_log = feedback ? [] : null
+    let stop_reason = null
+    let blocking_block = null
+    if (chase) bot.pathfinder.setGoal(new goals.GoalFollow(e, 1.5), true)
     try {
-      while (s.bot === bot && bot.entities[entity_id] && e.isValid && Date.now() - t0 < timeout && !s.interruptedBy) {
+      while (s.bot === bot && bot.entities[entity_id] && e.isValid && Date.now() - t0 < effTimeout && !s.interruptedBy) {
         requireConnected(s, bot)
-        if (e.position.distanceTo(bot.entity.position) < 3.2) {
-          await bot.lookAt(e.position.offset(0, e.height * 0.8, 0), true)
+        const dist = e.position.distanceTo(bot.entity.position)
+        if (dist < 3.2) {
+          const entityHeight = e.height || 1.8
+          const halfWidth = (e.width || 0.6) * 0.5
+          const eye = bot.entity.position.offset(0, bot.entity.eyeHeight || 1.62, 0)
+          const isBlocked = (blk, aim, aimDist) => {
+            if (!blk || !blk.intersect || blk.boundingBox === 'empty') return false
+            const dir = aimDist > 1e-6 ? aim.minus(eye).scaled(1 / aimDist) : null
+            const boxT = dir ? rayBox(eye, dir, e.position.offset(-halfWidth, 0, -halfWidth), e.position.offset(halfWidth, entityHeight, halfWidth)) : null
+            const reachLimit = boxT !== null ? boxT : Math.max(0, aimDist - halfWidth)
+            return eye.distanceTo(blk.intersect) < reachLimit - 1e-3
+          }
+          const upperAim = e.position.offset(0, entityHeight * 0.8, 0)
+          await bot.lookAt(upperAim, true)
           requireConnected(s, bot)
+          if (!bot.entities[entity_id] || !e.isValid || s.interruptedBy) break
+          let occluded = false
+          if (!chase || feedback) {
+            const upperDist = eye.distanceTo(upperAim)
+            const upperBlk = typeof bot.blockAtCursor === 'function' ? bot.blockAtCursor(upperDist) : null
+            if (isBlocked(upperBlk, upperAim, upperDist)) {
+              const midAim = e.position.offset(0, entityHeight * 0.5, 0)
+              await bot.lookAt(midAim, true)
+              requireConnected(s, bot)
+              if (!bot.entities[entity_id] || !e.isValid || s.interruptedBy) break
+              const midDist = eye.distanceTo(midAim)
+              const midBlk = typeof bot.blockAtCursor === 'function' ? bot.blockAtCursor(midDist) : null
+              if (isBlocked(midBlk, midAim, midDist)) {
+                occluded = true
+                if (!chase) {
+                  const blk = midBlk || upperBlk
+                  blocking_block = { name: blk.name, pos: blk.position ? [blk.position.x, blk.position.y, blk.position.z] : null }
+                  stop_reason = 'blocked_by_wall'
+                  break
+                }
+              }
+            }
+          }
           bot.attack(e); hits++
-          if (max_hits && hits >= max_hits) break
+          if (feedback) {
+            const hitDist = e.position.distanceTo(bot.entity.position)
+            const rec = {
+              hit: hits,
+              t_ms: Date.now() - t0,
+              entity_id: e.id ?? entity_id,
+              dist: +hitDist.toFixed(2),
+              target_pos: [+e.position.x.toFixed(2), +e.position.y.toFixed(2), +e.position.z.toFixed(2)],
+              bot_hp: bot.health !== undefined ? +bot.health.toFixed(1) : null,
+              ...(occluded ? { occluded: true } : {}),
+            }
+            hit_log.push(rec)
+            if (typeof s.pushEvent === 'function') s.pushEvent('attack_hit', rec)
+          }
+          if (max_hits && hits >= max_hits) {
+            stop_reason = 'max_hits'
+            break
+          }
         }
-        await sleep(interval)
+        const rem = effTimeout - (Date.now() - t0)
+        if (rem <= 0) break
+        const waitMs = (dist < 3.2 || chase) ? interval : Math.min(interval, 100)
+        await sleep(Math.min(waitMs, rem))
       }
-    } finally { bot.pathfinder.setGoal(null) }
+    } finally {
+      if (chase && bot.pathfinder) bot.pathfinder.setGoal(null)
+    }
     requireConnected(s, bot)
     const killed = !bot.entities[entity_id] || !e.isValid
-    if (killed) await collectDrops(s, e.position, 5)
+    if (!stop_reason) {
+      if (killed) stop_reason = 'killed'
+      else if (s.interruptedBy) stop_reason = 'interrupted'
+      else if (!chase && hits === 0) stop_reason = 'out_of_reach'
+      else stop_reason = 'timeout'
+    }
+    if (killed && chase) await collectDrops(s, e.position, 5)
     requireConnected(s, bot)
-    return { killed, hits, interval_ms: interval, ms: Date.now() - t0, inventory: invCounts(bot) }
+    const base = { killed, hits, interval_ms: interval, ms: Date.now() - t0, inventory: invCounts(bot) }
+    if (!feedback && chase) return base
+    return {
+      ...base,
+      ...(feedback ? { hit_log } : {}),
+      stop_reason,
+      ...(blocking_block ? { blocking_block } : {}),
+    }
   },
   // Fire a bow, crossbow or trident at a visible entity or an explicit point.
   // The point form is useful for targets such as target blocks and buttons.
