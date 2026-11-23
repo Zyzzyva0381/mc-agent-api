@@ -1310,46 +1310,259 @@ function seeThroughTable(mcData) {
 
 // want(stateId) 为真且至少一面挨着透明 / 无碰撞箱方块的位置；返回按距离排序的前 max 个 [x, y, z, dist, stateId]
 async function scanExposed(s, radius, want, max) {
+  if (max <= 0) return []
   const bot = s.bot
   const me = bot.entity.position
   const see = seeThroughTable(s.mcData)
   const minY = bot.game.minY, maxY = bot.game.minY + bot.game.height - 1
   const cols = new Map()
   const tmp = { x: 0, y: 0, z: 0 }
+  const colKey = (cx, cz) => cx * 4294967296 + (cz >>> 0)
+  const getCol = (cx, cz) => {
+    const key = colKey(cx, cz)
+    let c = cols.get(key)
+    if (c === undefined) { c = bot.world.getColumn(cx, cz) || null; cols.set(key, c) }
+    return c
+  }
   const sid = (x, y, z) => {
     if (y < minY || y > maxY) return -1
-    const key = (x >> 4) * 65536 + (z >> 4)
-    let c = cols.get(key)
-    if (c === undefined) { c = bot.world.getColumn(x >> 4, z >> 4) || null; cols.set(key, c) }
+    const c = getCol(x >> 4, z >> 4)
     if (!c) return -1
     tmp.x = x & 15; tmp.y = y; tmp.z = z & 15
     return c.getBlockStateId(tmp)
   }
   const open = (x, y, z) => { const v = sid(x, y, z); return v >= 0 && see[v] === 1 }
-  const out = []
-  const r = Math.ceil(radius) + 1
-  const cx = Math.floor(me.x), cy = Math.floor(me.y), cz = Math.floor(me.z)
-  let t0 = Date.now(), n = 0
-  for (let x = cx - r; x <= cx + r; x++) {
-    for (let z = cz - r; z <= cz + r; z++) {
-      const dxz = (x - me.x) ** 2 + (z - me.z) ** 2
-      if (dxz > radius * radius) continue
-      for (let y = Math.max(cy - r, minY); y <= Math.min(cy + r, maxY); y++) {
-        const d2 = dxz + (y - me.y) ** 2
-        if (d2 > radius * radius) continue
-        const v = sid(x, y, z)
-        if (v < 0 || !want(v)) continue
-        if (open(x + 1, y, z) || open(x - 1, y, z) || open(x, y + 1, z) || open(x, y - 1, z) || open(x, y, z + 1) || open(x, y, z - 1)) out.push([x, y, z, Math.sqrt(d2), v])
-      }
-      if (++n % 64 === 0 && Date.now() - t0 > 4) {
-        await new Promise(res => setImmediate(res))
-        if (s.bot !== bot || !bot.entity) fail('not_connected', 'bot disconnected during find_blocks')
-        t0 = Date.now()
-      }
+
+  const r2 = radius * radius
+  const xMin = Math.floor(me.x - radius), xMax = Math.ceil(me.x + radius)
+  const zMin = Math.floor(me.z - radius), zMax = Math.ceil(me.z + radius)
+  const yMin = Math.max(Math.floor(me.y - radius), minY)
+  const yMax = Math.min(Math.ceil(me.y + radius), maxY)
+  if (yMin > yMax) return []
+
+  // 先收集球体覆盖到的已加载区块列，按最短水平距离升序遍历；
+  // 配合 cutoff2 提前剪枝，稠密目标（或摘要模式）凑满 max 个最近结果即可停止。
+  const chunkCols = []
+  for (let cx = xMin >> 4; cx <= (xMax >> 4); cx++) {
+    const bx0 = cx << 4
+    const nearX = me.x < bx0 ? bx0 : (me.x > bx0 + 15 ? bx0 + 15 : me.x)
+    const dxNear = nearX - me.x
+    const dxNear2 = dxNear * dxNear
+    if (dxNear2 > r2) continue
+    for (let cz = zMin >> 4; cz <= (zMax >> 4); cz++) {
+      const bz0 = cz << 4
+      const nearZ = me.z < bz0 ? bz0 : (me.z > bz0 + 15 ? bz0 + 15 : me.z)
+      const dzNear = nearZ - me.z
+      const colMinDist2 = dxNear2 + dzNear * dzNear
+      if (colMinDist2 > r2) continue
+      const col = getCol(cx, cz)
+      if (!col) continue
+      chunkCols.push({ cx, cz, bx0, bz0, col, colMinDist2 })
     }
   }
+  chunkCols.sort((a, b) => a.colMinDist2 - b.colMinDist2)
+
+  const out = []
+  let cutoff2 = r2
+  let hasCutoff = false
+  let t0 = Date.now(), ops = 0
+  const want0 = !!want(0)
+  const solidCache = new Map()
+  const isAllSolid = (cx, si, cz, expectMinY) => {
+    const col = getCol(cx, cz)
+    if (!col) return true
+    if (!Array.isArray(col.sections)) return false
+    const cMinY = typeof col.minY === 'number' ? col.minY : minY
+    if (cMinY !== expectMinY) return false
+    if (si < 0 || si >= col.sections.length) return true
+    const key = colKey(cx, cz)
+    let arr = solidCache.get(key)
+    if (!arr) { arr = new Int8Array(col.sections.length); arr.fill(-1); solidCache.set(key, arr) }
+    if (arr[si] !== -1) return arr[si] === 1
+    const sec = col.sections[si]
+    let solid = false
+    if (!sec) {
+      solid = see[0] !== 1
+    } else {
+      const d = sec.data
+      if (d && Array.isArray(d.palette)) {
+        solid = true
+        for (let i = 0; i < d.palette.length; i++) if (see[d.palette[i]] === 1) { solid = false; break }
+      } else if (d && typeof d.value === 'number') {
+        solid = see[d.value] !== 1
+      }
+    }
+    arr[si] = solid ? 1 : 0
+    return solid
+  }
+
+  for (const { cx, cz, bx0, bz0, col, colMinDist2 } of chunkCols) {
+    if (colMinDist2 > cutoff2) break
+    const lx0 = Math.max(0, xMin - bx0), lx1 = Math.min(15, xMax - bx0)
+    const lz0 = Math.max(0, zMin - bz0), lz1 = Math.min(15, zMax - bz0)
+
+    if (Array.isArray(col.sections)) {
+      const colMinY = typeof col.minY === 'number' ? col.minY : minY
+      const secMin = Math.max(0, (yMin - colMinY) >> 4)
+      const secMax = Math.min(col.sections.length - 1, (yMax - colMinY) >> 4)
+      for (let si = secMin; si <= secMax; si++) {
+        const secY0 = colMinY + (si << 4)
+        const secY1 = secY0 + 15
+        const nearY = me.y < secY0 ? secY0 : (me.y > secY1 ? secY1 : me.y)
+        const dyNear = nearY - me.y
+        if (colMinDist2 + dyNear * dyNear > cutoff2) continue
+
+        const section = col.sections[si]
+        if (!section && !want0) continue
+
+        const data = section && section.data
+        const hasPalette = !!(data && Array.isArray(data.palette))
+        const isSingle = !!(data && !hasPalette && typeof data.value === 'number')
+        const singleVal = !section ? 0 : (isSingle ? data.value : -1)
+
+        // 先做调色板 / 单值过滤，不含目标方块则 O(1) / O(palette) 跳过整段
+        let palMatch = null
+        let rawData = null
+        if (!section || isSingle) {
+          if (!want(singleVal)) continue
+        } else if (hasPalette) {
+          const palette = data.palette
+          let any = false
+          palMatch = new Uint8Array(palette.length)
+          for (let pi = 0; pi < palette.length; pi++) {
+            if (want(palette[pi])) { palMatch[pi] = 1; any = true }
+          }
+          if (!any) continue
+          if (data.data && typeof data.data.get === 'function') rawData = data.data
+        }
+
+        // 若整段自身不含任何透明/无碰撞箱方块，只有紧贴非全实心邻段的边界面才可能暴露；
+        // 6 个邻段也全为实心时整段不可能有暴露方块，直接跳过。
+        const selfSolid = isAllSolid(cx, si, cz, colMinY)
+        let fX0 = false, fX1 = false, fZ0 = false, fZ1 = false, fY0 = false, fY1 = false
+        if (selfSolid) {
+          fX0 = !isAllSolid(cx - 1, si, cz, colMinY)
+          fX1 = !isAllSolid(cx + 1, si, cz, colMinY)
+          fZ0 = !isAllSolid(cx, si, cz - 1, colMinY)
+          fZ1 = !isAllSolid(cx, si, cz + 1, colMinY)
+          fY0 = !isAllSolid(cx, si - 1, cz, colMinY)
+          fY1 = !isAllSolid(cx, si + 1, cz, colMinY)
+          if (!fX0 && !fX1 && !fZ0 && !fZ1 && !fY0 && !fY1) continue
+        }
+
+        const ly0 = Math.max(0, yMin - secY0), ly1 = Math.min(15, yMax - secY0)
+        if (!section || isSingle) {
+          for (let lx = lx0; lx <= lx1; lx++) {
+            const x = bx0 + lx
+            const dx2 = (x - me.x) ** 2
+            if (dx2 > cutoff2) continue
+            const xFace = (fX0 && lx === 0) || (fX1 && lx === 15)
+            for (let lz = lz0; lz <= lz1; lz++) {
+              const z = bz0 + lz
+              const dxz = dx2 + (z - me.z) ** 2
+              if (dxz > cutoff2) continue
+              const xzFace = xFace || (fZ0 && lz === 0) || (fZ1 && lz === 15)
+              for (let ly = ly0; ly <= ly1; ly++) {
+                if (selfSolid && !xzFace && !(fY0 && ly === 0) && !(fY1 && ly === 15)) continue
+                const y = secY0 + ly
+                const d2 = dxz + (y - me.y) ** 2
+                if (d2 > cutoff2) continue
+                if (open(x + 1, y, z) || open(x - 1, y, z) || open(x, y + 1, z) || open(x, y - 1, z) || open(x, y, z + 1) || open(x, y, z - 1)) out.push([x, y, z, d2, singleVal])
+              }
+              if ((++ops & 63) === 0 && Date.now() - t0 > 4) {
+                await new Promise(res => setImmediate(res))
+                if (s.bot !== bot || !bot.entity) fail('not_connected', 'bot disconnected during find_blocks')
+                t0 = Date.now()
+              }
+            }
+          }
+          continue
+        }
+
+        const secGet = data && typeof data.get === 'function' ? data : null
+        for (let lx = lx0; lx <= lx1; lx++) {
+          const x = bx0 + lx
+          const dx2 = (x - me.x) ** 2
+          if (dx2 > cutoff2) continue
+          const xFace = (fX0 && lx === 0) || (fX1 && lx === 15)
+          for (let lz = lz0; lz <= lz1; lz++) {
+            const z = bz0 + lz
+            const dxz = dx2 + (z - me.z) ** 2
+            if (dxz > cutoff2) continue
+            const xzFace = xFace || (fZ0 && lz === 0) || (fZ1 && lz === 15)
+            const xzIdx = (lz << 4) | lx
+            for (let ly = ly0; ly <= ly1; ly++) {
+              if (selfSolid && !xzFace && !(fY0 && ly === 0) && !(fY1 && ly === 15)) continue
+              const y = secY0 + ly
+              const d2 = dxz + (y - me.y) ** 2
+              if (d2 > cutoff2) continue
+              let v
+              if (rawData) {
+                const pi = rawData.get((ly << 8) | xzIdx)
+                if (!palMatch[pi]) continue
+                v = data.palette[pi]
+              } else if (secGet) {
+                v = secGet.get((ly << 8) | xzIdx)
+                if (!want(v)) continue
+              } else {
+                tmp.x = lx; tmp.y = y; tmp.z = lz
+                v = col.getBlockStateId(tmp)
+                if (v < 0 || !want(v)) continue
+              }
+              if (open(x + 1, y, z) || open(x - 1, y, z) || open(x, y + 1, z) || open(x, y - 1, z) || open(x, y, z + 1) || open(x, y, z - 1)) out.push([x, y, z, d2, v])
+            }
+            if ((++ops & 63) === 0 && Date.now() - t0 > 4) {
+              await new Promise(res => setImmediate(res))
+              if (s.bot !== bot || !bot.entity) fail('not_connected', 'bot disconnected during find_blocks')
+              t0 = Date.now()
+            }
+          }
+        }
+      }
+    } else {
+      // 兼容没有 sections 结构的自定义 / 旧版区块对象
+      for (let lx = lx0; lx <= lx1; lx++) {
+        const x = bx0 + lx
+        const dx2 = (x - me.x) ** 2
+        if (dx2 > cutoff2) continue
+        for (let lz = lz0; lz <= lz1; lz++) {
+          const z = bz0 + lz
+          const dxz = dx2 + (z - me.z) ** 2
+          if (dxz > cutoff2) continue
+          for (let y = yMin; y <= yMax; y++) {
+            const d2 = dxz + (y - me.y) ** 2
+            if (d2 > cutoff2) continue
+            tmp.x = lx; tmp.y = y; tmp.z = lz
+            const v = col.getBlockStateId(tmp)
+            if (v < 0 || !want(v)) continue
+            if (open(x + 1, y, z) || open(x - 1, y, z) || open(x, y + 1, z) || open(x, y - 1, z) || open(x, y, z + 1) || open(x, y, z - 1)) out.push([x, y, z, d2, v])
+          }
+          if ((++ops & 63) === 0 && Date.now() - t0 > 4) {
+            await new Promise(res => setImmediate(res))
+            if (s.bot !== bot || !bot.entity) fail('not_connected', 'bot disconnected during find_blocks')
+            t0 = Date.now()
+          }
+        }
+      }
+    }
+
+    if (out.length > max || (!hasCutoff && out.length === max)) {
+      out.sort((a, b) => a[3] - b[3])
+      out.length = max
+      cutoff2 = out[max - 1][3]
+      hasCutoff = true
+    }
+    if ((++ops & 63) === 0 && Date.now() - t0 > 4) {
+      await new Promise(res => setImmediate(res))
+      if (s.bot !== bot || !bot.entity) fail('not_connected', 'bot disconnected during find_blocks')
+      t0 = Date.now()
+    }
+  }
+
   out.sort((a, b) => a[3] - b[3])
-  return out.slice(0, max)
+  if (out.length > max) out.length = max
+  for (let i = 0; i < out.length; i++) out[i][3] = Math.sqrt(out[i][3])
+  return out
 }
 
 function isExposed(s, p) {
@@ -2011,15 +2224,18 @@ const api = {
   },
   async find_blocks(s, { types, radius = 16, limit = 20, properties, mature }) {
     if (!s.bot) fail('not_connected', 'bot not connected')
+    if (types !== undefined && types !== null && !Array.isArray(types)) fail('bad_args', 'types must be an array of block names')
+    const hasTypes = Array.isArray(types) && types.length > 0
+    const maxRadius = hasTypes ? 128 : 64
     radius = Number(radius)
     limit = Number(limit)
-    if (!Number.isFinite(radius) || radius < 1) fail('bad_args', 'radius must be a number between 1 and 64')
+    if (!Number.isFinite(radius) || radius < 1) fail('bad_args', `radius must be a number between 1 and ${maxRadius}`)
     if (!Number.isFinite(limit) || limit < 1) fail('bad_args', 'limit must be a positive number')
-    radius = Math.min(radius, 64)
+    radius = Math.min(radius, maxRadius)
     const skip = new Set(['air', 'cave_air', 'void_air'])
     const me = s.bot.entity.position
-    if ((properties || mature !== undefined) && !(types && types.length)) fail('bad_args', 'properties / mature filters require types')
-    if (types && types.length) {
+    if ((properties || mature !== undefined) && !hasTypes) fail('bad_args', 'properties / mature filters require types')
+    if (hasTypes) {
       const ids = types.map(n => { const b = s.mcData.blocksByName[n]; if (!b) fail('bad_args', `unknown block ${n}`); return b.id })
       if (properties) checkPropFilter(s, types, properties)
       if (mature !== undefined && !types.some(n => CROP_AGE_PROP[n])) fail('bad_args', `mature filter only applies to crops: ${Object.keys(CROP_AGE_PROP).join(', ')}`)
@@ -3152,4 +3368,4 @@ function patchBrokenPickaxeMaterials(reg) {
 // window_view 会走路并打开界面，要占动作锁，所以不放进只读集合
 const READONLY = new Set(['status', 'inventory', 'find_blocks', 'get_entities', 'events', 'advancements', 'get_block', 'stop', 'connect', 'disconnect', 'posture', 'look'])
 
-module.exports = { configure, Session, sessions, api, READONLY, ApiError, fail, fmt, log, sleep, patchBrokenPickaxeMaterials }
+module.exports = { configure, Session, sessions, api, READONLY, ApiError, fail, fmt, log, sleep, patchBrokenPickaxeMaterials, scanExposed }
