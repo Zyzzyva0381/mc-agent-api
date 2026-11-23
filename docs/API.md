@@ -365,10 +365,15 @@ POST /advancements  {"status": "completed", "include_recipes": false}
 
 ```
 POST /move_to  {"x": 100, "z": -200, "range": 1}
+POST /move_to  {"x": 100, "y": 64, "z": -200, "range": 0}
 POST /move_to  {"entity_id": 12345, "range": 2}
+POST /move_to  {"x": 200, "z": -300, "allow_partial": true}
 ```
 
-省略 `y` 时只要求到达水平坐标。`result`：`{"pos": [100.2, 64.0, -199.8]}`；跨维度时附 `dimension_changed: {"from","to"}`。
+- `range`：坐标移动默认 `1`（靠近目标周围 1 格即停，兼容直接传实心方块坐标的场景）；传 `0`（或 `< 1`）时进入精确目标格并用真实物理按键微调到目标中心（传整数坐标时对准方块中心 `+0.5`，传小数坐标时对准指定位置，误差 ≤ 0.15 格）。
+- `entity_id`：未传 `range` 时，掉落物（`item`）默认 `0.5`（走到可直接拾取），其它实体默认 `2`；显式传 `range` 时按传入值生效（不再强制 ≥ 2）。
+- `allow_partial`：默认 `false`（到不了终点直接返回 `path_not_found`）；传 `true` 时若终点不可达但 A* 找到了更接近终点的可达点，会先走到最近可达点并返回 `partial: true`。
+- 省略 `y` 时只要求到达水平坐标。`result`：`{"pos": [100.2, 64.0, -199.8], "dist": 0.36}`（部分靠近时附 `partial: true`，跨维度时附 `dimension_changed: {"from","to"}`）。失败时 `error` 附带 `pos`、`dist_left`，必要时给出 `target_unloaded: true` 或 `target_solid: true`。
 
 **骑乘态自动切掌舵**：当 `status.in_vehicle` 非空时，同一个 `move_to` 不再走路，而是驱动载具（船 / 炽足兽 / 猪 / 马等）驶向目标，`y` 忽略：
 

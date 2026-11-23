@@ -207,6 +207,7 @@ class Session {
     })
     const worldBot = s.bot
     worldBot.loadPlugin(pathfinder)
+    if (worldBot.pathfinder) worldBot.pathfinder.goto = createSafeGoto(worldBot)
     worldBot.once('inject_allowed', () => installMovementCompatibility(worldBot))
     // mineflayer 回显 accepts teleport 用的 teleportId 来自它最后看到的 position 包。
     // Velocity 切后端（play -> configuration -> play）时会漏出一个没有 teleportId 的
@@ -410,14 +411,11 @@ class Session {
       s.mcData = require('minecraft-data')(s.bot.version)
       patchBrokenPickaxeMaterials(s.mcData)
       patchBrokenPickaxeMaterials(s.bot.registry)
-      const m = new Movements(s.bot)
-      m.canDig = false
-      m.allow1by1towers = false
-      m.allowSprinting = true
-      m.scafoldingBlocks = []
-      m.allowParkour = true
-      s.bot.pathfinder.setMovements(m)
-      s.bot.pathfinder.thinkTimeout = 15000
+      s.bot.pathfinder.goto = createSafeGoto(s.bot)
+      s.bot.pathfinder.setMovements(createMovements(s.bot))
+      // 4 s 思考上限（20 ms/tick 约合 1.6 s 纯 A* 算力，足够覆盖 128 格视距），
+      // 避免不可达目标白算 15 s 触发 8 s stalled 看门狗或拖死 allow_partial
+      s.bot.pathfinder.thinkTimeout = 4000
       // 每个物理 tick（50 ms）里寻路最多算 20 ms：所有 bot 同时寻路时不至于把 CPU 吃满、拖慢别的请求
       s.bot.pathfinder.tickTimeout = 20
       s.log('SPAWN', fmt(s.bot.entity.position))
@@ -734,16 +732,179 @@ async function withTimeout(promise, ms, what) {
   } finally { clearTimeout(timer) }
 }
 
+const EXTRA_AVOID_BLOCKS = ['sweet_berry_bush', 'cactus', 'magma_block', 'campfire', 'soul_campfire', 'powder_snow', 'wither_rose']
+
+function createMovements(bot, { parkour = true, sprint = true } = {}) {
+  const m = new Movements(bot)
+  m.canDig = false
+  m.allow1by1towers = false
+  m.allowSprinting = sprint
+  m.scafoldingBlocks = []
+  m.allowParkour = parkour
+  const blocksByName = bot.registry && bot.registry.blocksByName
+  if (blocksByName) {
+    for (const name of EXTRA_AVOID_BLOCKS) {
+      if (blocksByName[name]) m.blocksToAvoid.add(blocksByName[name].id)
+    }
+  }
+  return m
+}
+
+// 替换 mineflayer-pathfinder/lib/goto.js 的默认实现：
+// 原版先判 results.path.length === 0 再判 status，导致 noPath/timeout 且 path 为空时误当成功，
+// 以及 tickTimeout 产生 partial + path:[] 时立刻返回成功却残留 stateGoal 在后台继续乱走。
+function createSafeGoto(bot) {
+  return function safeGoto(goal, { allowPartial = false } = {}) {
+    return new Promise((resolve, reject) => {
+      let done = false
+      let tickCount = 0
+      let partialPending = false
+      let partialReason = null
+      let partialStartTick = -1
+
+      const makeErr = (name, message) => { const e = new Error(message); e.name = name; return e }
+      const finish = (err, val) => {
+        if (done) return
+        done = true
+        bot.removeListener('goal_reached', onReached)
+        bot.removeListener('path_update', onUpdate)
+        bot.removeListener('goal_updated', onGoalUpdated)
+        bot.removeListener('path_stop', onStop)
+        bot.removeListener('path_reset', onReset)
+        bot.removeListener('physicsTick', onTick)
+        setTimeout(() => {
+          if (bot.pathfinder && bot.pathfinder.goal === goal) {
+            try { bot.pathfinder.setGoal(null) } catch {}
+          }
+          if (err) reject(err)
+          else resolve(val)
+        }, 0)
+      }
+
+      const onReached = () => finish(null, { reached: true, partial: false })
+      const onGoalUpdated = newGoal => {
+        if (newGoal !== goal) finish(makeErr('GoalChanged', 'The goal was changed before it could be completed!'))
+      }
+      const onStop = () => finish(makeErr('PathStopped', 'Path was stopped before it could be completed! Thus, the desired goal was not reached.'))
+      const onReset = () => { partialPending = false }
+      const onUpdate = results => {
+        if (!results) return
+        if (results.status === 'partial') {
+          partialPending = false
+          return
+        }
+        if (results.status === 'noPath' || results.status === 'timeout') {
+          if (allowPartial && Array.isArray(results.path) && results.path.length > 0) {
+            partialPending = true
+            partialReason = results.status
+            partialStartTick = tickCount
+            return
+          }
+          // 清空 results.path，避免 monitorMovement 在本 tick 紧接着把它赋给 path 并走 1 tick
+          if (Array.isArray(results.path)) results.path.length = 0
+          if (results.status === 'noPath') finish(makeErr('NoPath', 'No path to the goal!'))
+          else finish(makeErr('Timeout', 'Took too long to decide path to goal!'))
+          return
+        }
+        if (results.status === 'success' && Array.isArray(results.path) && results.path.length === 0) {
+          const p = bot.entity && bot.entity.position
+          if (p && (goal.isEnd(p.floored()) || goal.isEnd(p.floored().offset(0, 1, 0)))) {
+            finish(null, { reached: true, partial: false })
+          }
+        }
+      }
+      const onTick = () => {
+        tickCount++
+        if (!partialPending || tickCount <= partialStartTick) return
+        const pf = bot.pathfinder
+        if (pf && !pf.isMoving() && !pf.isMining() && !pf.isBuilding()) {
+          finish(null, { reached: false, partial: true, reason: partialReason })
+        }
+      }
+
+      bot.on('path_stop', onStop)
+      bot.on('goal_reached', onReached)
+      bot.on('path_update', onUpdate)
+      bot.on('goal_updated', onGoalUpdated)
+      bot.on('path_reset', onReset)
+      bot.on('physicsTick', onTick)
+      bot.pathfinder.setGoal(goal)
+    })
+  }
+}
+
+// 精准停位微调：在 pathfinder 进入目标格后用真实物理按键（近距自动潜行防掉崖）收敛到目标点
+async function alignToPoint(s, aimX, aimZ, { tol = 0.15, maxMs = 600, stopWhen = null } = {}) {
+  const bot = requireConnected(s)
+  if (bot.vehicle || !bot.entity || typeof bot.look !== 'function' || typeof bot.setControlState !== 'function') return
+  // 若刚跳落还在半空，先等落地（最多 400 ms），避免在空中返回或未着地就测距
+  const landBy = Date.now() + 400
+  while (Date.now() < landBy && s.bot === bot && bot.entity && !bot.entity.onGround && !bot.entity.isInWater && !bot.entity.isInLava) {
+    if (!s.alive || s.interruptedBy || (stopWhen && stopWhen())) break
+    await sleep(50)
+  }
+  requireConnected(s, bot)
+  const p0 = bot.entity.position
+  const d0 = Math.hypot(aimX - p0.x, aimZ - p0.z)
+  if (d0 <= tol || d0 > 1.35) return
+  const deadline = Date.now() + maxMs
+  let bestDist = d0
+  let staleTicks = 0
+  try {
+    while (Date.now() < deadline) {
+      requireConnected(s, bot)
+      if (!s.alive || s.interruptedBy) break
+      if (stopWhen && stopWhen()) break
+      const p = bot.entity.position
+      const dx = aimX - p.x, dz = aimZ - p.z
+      const d = Math.hypot(dx, dz)
+      if (d <= tol) break
+      if (d < bestDist - 0.01) { bestDist = d; staleTicks = 0 }
+      else if (++staleTicks >= 4) break
+      bot.look(Math.atan2(-dx, -dz), 0, true)
+      bot.setControlState('forward', true)
+      bot.setControlState('sprint', false)
+      bot.setControlState('sneak', d < 0.5 && !!bot.entity.onGround)
+      await sleep(50)
+    }
+  } finally {
+    if (s.bot === bot && bot.entity && typeof bot.clearControlStates === 'function') bot.clearControlStates()
+  }
+  if (s.bot === bot && bot.entity) await sleep(50)
+}
+
 // pathfinder 卡在实体碰撞箱（例如船顶）或未加载区块时会一声不响地原地转圈，
-// 以前 move_to 会一直占着动作锁直到客户端 HTTP 超时。这里按位移做看门狗。
-async function gotoWatched(s, goal, timeout, stallMs = 8000) {
+// 以前 move_to 会一直占着动作锁直到客户端 HTTP 超时。这里按位移做看门狗，
+// 并在连续 stuck 2 次时自动临时关闭跑酷与疾跑做一次稳健降级重试。
+async function gotoWatched(s, goal, timeout, opts = 8000) {
+  const stallMs = typeof opts === 'number' ? opts : (opts.stallMs ?? 8000)
+  const allowPartial = typeof opts === 'object' && opts ? !!opts.allowPartial : false
   const bot = requireConnected(s)
   let last = bot.entity.position.clone()
   let lastMoveAt = Date.now()
+  let stuckResets = 0
+  let savedMovements = null
+
+  const onReset = reason => {
+    if (reason !== 'stuck') return
+    stuckResets++
+    const m = bot.pathfinder && bot.pathfinder.movements
+    if (stuckResets >= 2 && !savedMovements && m && (m.allowParkour || m.allowSprinting)) {
+      savedMovements = { m, parkour: m.allowParkour, sprint: m.allowSprinting }
+      m.allowParkour = false
+      m.allowSprinting = false
+      stuckResets = 0
+      lastMoveAt = Date.now()
+      if (s.log) s.log('pathfinder stuck x2, retrying without parkour/sprint')
+      if (typeof bot.pathfinder.setMovements === 'function') bot.pathfinder.setMovements(m)
+    }
+  }
+  bot.on('path_reset', onReset)
+
   const sampler = setInterval(() => {
     if (!bot.entity) return
     const p = bot.entity.position
-    if (p.distanceTo(last) > 0.35) { last = p.clone(); lastMoveAt = Date.now() }
+    if (p.distanceTo(last) > 0.35) { last = p.clone(); lastMoveAt = Date.now(); stuckResets = 0 }
   }, 400)
   let watchdog = null
   const stalled = new Promise((_, reject) => {
@@ -760,12 +921,23 @@ async function gotoWatched(s, goal, timeout, stallMs = 8000) {
     bot.once('end', onEnd)
   })
   try {
-    await withTimeout(Promise.race([bot.pathfinder.goto(goal), stalled, disconnected]), timeout, 'pathfinding')
+    const res = await withTimeout(Promise.race([bot.pathfinder.goto(goal, { allowPartial }), stalled, disconnected]), timeout, 'pathfinding')
     requireConnected(s, bot)
+    return res
+  } catch (e) {
+    if (bot.pathfinder) {
+      try { bot.pathfinder.setGoal(null) } catch {}
+    }
+    throw e
   } finally {
     bot.removeListener('end', onEnd)
+    bot.removeListener('path_reset', onReset)
     clearInterval(sampler)
     if (watchdog) clearInterval(watchdog)
+    if (savedMovements && bot.pathfinder && bot.pathfinder.movements === savedMovements.m) {
+      savedMovements.m.allowParkour = savedMovements.parkour
+      savedMovements.m.allowSprinting = savedMovements.sprint
+    }
   }
 }
 
@@ -784,7 +956,6 @@ async function goNear(s, pos, range, timeout = 60000, reach = null) {
   try {
     await gotoWatched(s, new goals.GoalNear(pos.x, pos.y, pos.z, range), timeout)
   } catch (e) {
-    bot.pathfinder.setGoal(null)
     requireConnected(s, bot)
     const from = bot.entity.position
     if (e instanceof ApiError) { e.extra = { pos: fmt(from), dist_left: +from.distanceTo(pos).toFixed(1), resets }; throw e }
@@ -2339,9 +2510,17 @@ const api = {
   },
 
   // ---------- actions ----------
-  async move_to(s, { x, y, z, range = 1, entity_id, timeout = 60000 }) {
+  async move_to(s, { x, y, z, range, entity_id, timeout = 60000, allow_partial = false }) {
     const bot = requireConnected(s)
     const dimensionBefore = bot.game.dimension
+    const hasRange = range !== undefined && range !== null
+    if (hasRange) {
+      range = Number(range)
+      if (!Number.isFinite(range) || range < 0) fail('bad_args', 'range must be a non-negative number')
+    }
+    timeout = Number(timeout)
+    if (!Number.isFinite(timeout) || timeout <= 0) fail('bad_args', 'timeout must be a positive number')
+    if (typeof allow_partial !== 'boolean') fail('bad_args', 'allow_partial must be a boolean')
     if (entity_id === undefined) {
       x = movementCoordinate(x, 'x')
       z = movementCoordinate(z, 'z')
@@ -2353,40 +2532,91 @@ const api = {
       if (entity_id !== undefined && !target) fail('no_such_entity', `entity ${entity_id} not visible`)
       const tx = target ? target.position.x : x
       const tz = target ? target.position.z : z
-      const out = await driveVehicle(s, tx, tz, Math.max(range, 1.5), timeout)
+      const out = await driveVehicle(s, tx, tz, Math.max(hasRange ? range : 1, 1.5), timeout)
       requireConnected(s, bot)
       return { ...out, pos: fmt(bot.entity.position), drove: true }
     }
+
+    let aimX, aimY = null, aimZ, bx, by = null, bz, hasY, effRange, isItem = false
+    if (entity_id !== undefined) {
+      const e = bot.entities[entity_id]
+      if (!e) fail('no_such_entity', `entity ${entity_id} not visible`)
+      isItem = e.name === 'item'
+      effRange = hasRange ? range : (isItem ? 0.5 : 2)
+      aimX = e.position.x; aimY = e.position.y; aimZ = e.position.z
+      bx = Math.floor(aimX); by = Math.floor(aimY); bz = Math.floor(aimZ)
+      hasY = true
+    } else {
+      effRange = hasRange ? range : 1
+      aimX = Number.isInteger(x) ? x + 0.5 : x
+      aimZ = Number.isInteger(z) ? z + 0.5 : z
+      bx = Math.floor(x); bz = Math.floor(z)
+      hasY = y !== undefined && y !== null
+      if (hasY) { aimY = y; by = Math.floor(y) }
+    }
+
+    const distTo = p => hasY
+      ? Math.hypot(p.x - aimX, p.y - aimY, p.z - aimZ)
+      : Math.hypot(p.x - aimX, p.z - aimZ)
+    const exact = effRange < 1
+    const alignTol = Math.max(effRange, 0.15)
+    const p0 = bot.entity.position
+    const inTargetBlock = Math.floor(p0.x) === bx && Math.floor(p0.z) === bz && (!hasY || Math.abs(p0.y - by) <= 0.55)
+    const alreadyAt = exact
+      ? (inTargetBlock && Math.hypot(p0.x - aimX, p0.z - aimZ) <= alignTol)
+      : (distTo(p0) <= effRange)
+    if (alreadyAt) return { pos: fmt(p0), dist: +distTo(p0).toFixed(2) }
+
+    const isFullSolid = b => !!b && b.boundingBox === 'block' && b.name !== 'ladder' && b.name !== 'vine' && (!Array.isArray(b.shapes) || b.shapes.length === 0 || b.shapes.some(sh => sh[4] >= 1))
+    const t0 = Date.now()
+    let pathRes = null
     try {
-      if (entity_id !== undefined) {
-        const e = bot.entities[entity_id]
-        if (!e) fail('no_such_entity', `entity ${entity_id} not visible`)
-        await goNear(s, e.position, Math.max(range, 2), timeout)
-      } else if (y === undefined || y === null) {
-        const t0 = Date.now()
-        try {
-          await gotoWatched(s, new goals.GoalNearXZ(x, z, range), timeout)
-        } catch (e) {
-          bot.pathfinder.setGoal(null)
-          requireConnected(s, bot)
-          if (e instanceof ApiError) throw e
-          fail('path_not_found', e.message, { pos: fmt(bot.entity.position), ms: Date.now() - t0 })
+      if (exact && !allow_partial && hasY && typeof bot.blockAt === 'function') {
+        const tb = bot.blockAt(new Vec3(bx, by, bz))
+        if (isFullSolid(tb)) {
+          fail('path_not_found', `target block (${bx}, ${by}, ${bz}) is solid (${tb.name}); use range >= 1 or aim above it`, {
+            pos: fmt(p0), dist_left: +distTo(p0).toFixed(1), ms: 0, target_solid: true
+          })
         }
-      } else {
-        await goNear(s, new Vec3(x, y, z), range, timeout)
+      }
+      if (!(exact && inTargetBlock)) {
+        const goal = hasY
+          ? (exact ? new goals.GoalBlock(bx, by, bz) : new goals.GoalNear(bx, by, bz, effRange))
+          : (exact ? new goals.GoalXZ(bx, bz) : new goals.GoalNearXZ(bx, bz, effRange))
+        pathRes = await gotoWatched(s, goal, timeout, { allowPartial: allow_partial })
+      }
+      if (exact && !(pathRes && pathRes.partial)) {
+        await alignToPoint(s, aimX, aimZ, { tol: alignTol, stopWhen: isItem ? () => !bot.entities[entity_id] : null })
       }
     } catch (e) {
       // Entering an End portal changes dimension immediately. Pathfinder then
       // rejects its old-world goal, even though the requested movement worked.
       requireConnected(s, bot)
       if (bot.game.dimension !== dimensionBefore) {
-        bot.pathfinder.setGoal(null)
         return { pos: fmt(bot.entity.position), dimension_changed: { from: dimensionBefore, to: bot.game.dimension } }
       }
-      throw e
+      const from = bot.entity.position
+      const diag = { pos: fmt(from), dist_left: +distTo(from).toFixed(1), ms: Date.now() - t0 }
+      if (hasY && typeof bot.blockAt === 'function') {
+        const tb = bot.blockAt(new Vec3(bx, by, bz))
+        if (!tb) diag.target_unloaded = true
+        else if (exact && tb.boundingBox === 'block') diag.target_solid = true
+      } else if (!hasY && bot.world && typeof bot.world.getColumn === 'function') {
+        if (!bot.world.getColumn(bx >> 4, bz >> 4)) diag.target_unloaded = true
+      }
+      if (e instanceof ApiError) {
+        e.extra = { ...(e.extra || {}), ...diag }
+        throw e
+      }
+      fail('path_not_found', e.message, diag)
     }
     requireConnected(s, bot)
-    return { pos: fmt(bot.entity.position) }
+    const pf = bot.entity.position
+    return {
+      pos: fmt(pf),
+      dist: +distTo(pf).toFixed(2),
+      ...(pathRes && pathRes.partial ? { partial: true } : {})
+    }
   },
   async dig(s, { x, y, z, collect = true }) {
     if (!s.bot) fail('not_connected', 'bot not connected')
@@ -3368,4 +3598,4 @@ function patchBrokenPickaxeMaterials(reg) {
 // window_view 会走路并打开界面，要占动作锁，所以不放进只读集合
 const READONLY = new Set(['status', 'inventory', 'find_blocks', 'get_entities', 'events', 'advancements', 'get_block', 'stop', 'connect', 'disconnect', 'posture', 'look'])
 
-module.exports = { configure, Session, sessions, api, READONLY, ApiError, fail, fmt, log, sleep, patchBrokenPickaxeMaterials, scanExposed }
+module.exports = { configure, Session, sessions, api, READONLY, ApiError, fail, fmt, log, sleep, patchBrokenPickaxeMaterials, scanExposed, createSafeGoto, createMovements }
