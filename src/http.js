@@ -110,9 +110,9 @@ async function handleRequest (req, res) {
     for (const [k, v] of new URLSearchParams(req.url.slice(qIndex + 1))) query[k] = v
     args = { ...query, ...args }
   }
-  // 坐标别名：观察接口返回的 pos 可以直接回填给动作接口
+  // 坐标别名：观察接口返回的 pos 可以直接回填给动作接口；保留 null/undefined（例如 move_to 省略 Y），不静默转成 0
   if (Array.isArray(args.pos) && args.pos.length === 3 && args.x === undefined) {
-    [args.x, args.y, args.z] = args.pos.map(Number)
+    [args.x, args.y, args.z] = args.pos.map(v => (v === null || v === undefined ? v : (typeof v === 'boolean' || v === '' ? NaN : Number(v))))
   }
 
   // Auth endpoints (no token required)
@@ -204,6 +204,7 @@ function start () {
     const v6 = http.createServer(handleRequest)
     v6.on('error', e => log('IPv6 loopback listener not started:', e.code || e.message))
     v6.listen({ port: config.http.port, host: '::1', ipv6Only: true }, () => log('Also listening on [::1]:' + config.http.port + ' (so http://localhost works without the IPv6 fallback delay)'))
+    server.on('close', () => { try { v6.close() } catch {} })
   }
   setInterval(sweep, 60000).unref()
   log('Server started, waiting for logins...')

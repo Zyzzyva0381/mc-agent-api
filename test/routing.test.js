@@ -195,3 +195,98 @@ test('RCON reads a quoted player selector and ignores unrelated response IDs', a
   assert.equal(command, 'execute if entity @a[name="测试角色",limit=1]')
   assert.equal(await connection.includesPlayer('Missing'), false)
 })
+
+test('onBackendUnconfirmed does not send play packets while in configuration state', () => {
+  configure({ config: {}, createReadiness: () => ({ guardsWorld: true, isReady: () => false }) })
+  const s = new Session('token', 'Agent_1', { name: 'Agent_1' }, {})
+  const calls = []
+  s.bot = {
+    _client: { state: 'configuration' },
+    usingHeldItem: true,
+    pathfinder: { setGoal: () => calls.push('setGoal') },
+    stopDigging: () => calls.push('stopDigging'),
+    deactivateItem: () => calls.push('deactivateItem'),
+    setControlState: () => {},
+    clearControlStates: () => calls.push('clearControlStates')
+  }
+  s.usingItem = { name: 'bow', t: Date.now() }
+  s.onBackendUnconfirmed()
+  assert.equal(s.bot.usingHeldItem, false)
+  assert.equal(s.usingItem, null)
+  assert.equal(calls.includes('deactivateItem'), false)
+  assert.equal(calls.includes('stopDigging'), false)
+
+  s.bot._client.state = 'play'
+  s.onBackendUnconfirmed()
+  assert.equal(calls.includes('deactivateItem'), true)
+  assert.equal(calls.includes('stopDigging'), true)
+})
+
+test('proxy dynamically reloads assignmentsFile and holds off immediate bounce-back after confirmed evacuation', async t => {
+  const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), 'routing-reload-'))
+  t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }))
+  const file = path.join(baseDir, 'assignments.json')
+  fs.writeFileSync(file, JSON.stringify({ Agent_1: 'first' }))
+
+  const probesByPort = new Map()
+  t.mock.method(rcon, 'create', cfg => {
+    const queue = []
+    probesByPort.set(cfg.port, queue)
+    return {
+      includesPlayer: () => new Promise((resolve, reject) => queue.push({ resolve, reject })),
+      close () {}
+    }
+  })
+
+  const session = {
+    route: { server: 'first', rcon: options.rcon },
+    profile: { name: 'Agent_1' },
+    log: t.mock.fn(),
+    pushEvent: t.mock.fn(),
+    onBackendUnconfirmed: t.mock.fn(),
+    hardReconnect: t.mock.fn()
+  }
+  const client = new EventEmitter()
+  client.state = 'play'
+  const chatCalls = []
+  const bot = Object.assign(new EventEmitter(), {
+    entity: {},
+    _client: client,
+    chat: msg => chatCalls.push(msg)
+  })
+
+  const readiness = proxy.create(session, { ...options, assignmentsFile: 'assignments.json' }, { baseDir })
+  t.after(() => readiness.destroy())
+  const move = state => {
+    const previous = client.state
+    client.state = state
+    client.emit('state', state, previous)
+  }
+
+  readiness.attach(bot)
+  bot.emit('spawn')
+  probesByPort.get(25575).shift().resolve(true)
+  await Promise.resolve()
+  assert.equal(readiness.isReady(), true)
+  assert.equal(readiness.server, 'first')
+
+  // Case 1: Temporary evacuation while assignments.json still says 'first' -> must NOT bounce back immediately
+  move('configuration')
+  move('play')
+  probesByPort.get(25575).shift().resolve(false)
+  await Promise.resolve()
+  assert.equal(readiness.isReady(), false)
+  assert.deepEqual(chatCalls, [])
+
+  // Case 2: assignments.json updated to 'second' -> proxy switches target server and confirms on 'second'
+  const nextMtime = new Date(Date.now() + 2000)
+  fs.writeFileSync(file, JSON.stringify({ Agent_1: 'second' }))
+  fs.utimesSync(file, nextMtime, nextMtime)
+  move('configuration')
+  move('play')
+  assert.equal(readiness.server, 'second')
+  probesByPort.get(25576).shift().resolve(true)
+  await Promise.resolve()
+  assert.equal(readiness.isReady(), true)
+  assert.equal(session.route.server, 'second')
+})

@@ -9,6 +9,14 @@ const { createMotionTracker } = require('./motion')
 const { installMovementCompatibility } = require('./movement-compat')
 
 const sleep = ms => new Promise(r => setTimeout(r, ms))
+async function sleepInterruptible (s, ms, bot = s.bot) {
+  const deadline = Date.now() + Math.max(0, ms)
+  while (Date.now() < deadline) {
+    if (s.interruptedBy || !s.alive || s.bot !== bot || !s.backendActionIsCurrent()) return false
+    await sleep(Math.min(50, deadline - Date.now()))
+  }
+  return !(s.interruptedBy || !s.alive || s.bot !== bot || !s.backendActionIsCurrent())
+}
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a)
 
 let config = null
@@ -129,9 +137,15 @@ class Session {
     if (this.interruptedBy && cause !== 'death') return
     this.interruptedBy = cause
     if (!this.bot) return
-    this.bot.pathfinder.setGoal(null)
-    try { this.bot.stopDigging() } catch {}
-    this.bot.clearControlStates()
+    this.bot.pathfinder?.setGoal?.(null)
+    if (this.bot._client?.state === 'play') {
+      try { this.bot.stopDigging() } catch {}
+      try { this.bot.deactivateItem() } catch {}
+    } else {
+      this.bot.usingHeldItem = false
+      this.usingItem = null
+    }
+    this.bot.clearControlStates?.()
     this.applyPosture()
   }
 
@@ -178,19 +192,27 @@ class Session {
     this.backendGeneration++
     const b = this.bot
     if (!b) return
+    const inPlay = b._client?.state === 'play'
     backendAction.exit(() => {
       this.clearPosture()
       this.releaseHeld()
       if (this.busy) this.interruptedBy = 'server_changed'
-      b.pathfinder.setGoal(null)
-      try { b.stopDigging() } catch {}
-      try { b.deactivateItem() } catch {}
-      b.clearControlStates()
+      b.pathfinder?.setGoal?.(null)
+      if (inPlay) {
+        try { b.stopDigging() } catch {}
+        try { b.deactivateItem() } catch {}
+      } else {
+        b.usingHeldItem = false
+        this.usingItem = null
+      }
+      b.clearControlStates?.()
     })
   }
 
   connect() {
     const s = this
+    s.usingItem = null
+    s.releaseHeld()
     s.advancementDefinitions.clear()
     s.advancementProgress.clear()
     s.advancementsReady = false
@@ -220,12 +242,20 @@ class Session {
     // "只有 id 0x00、没有 body" 的帧（1.21.9+ 已删除 player_command，就是这样翻车的）。
     // 所以这里再按协议 packet 映射表把 play 状态的写包拦一道（映射表才是包名全集，
     // packet_* 类型表会漏掉复用公共类型的包，例如 settings）。
-    let playOutPackets = new Set()
+    // 按每个协议状态（handshaking/status/login/configuration/play）的 packet 映射表把写包拦一道：
+    // 不仅防"写了协议里不存在的包名"，也防 Velocity 切后端进入 configuration 状态时
+    // mineflayer 残留回调误发 block_dig 等 play-only 包导致代理报 internal error 踢人。
+    const outPacketsByState = new Map()
     try {
       const proto = require('minecraft-data')(s.bot.version || config.minecraft.version).protocol
-      const cont = proto.play.toServer.types.packet
-      const mapperField = cont[1].find(f => f.type && Array.isArray(f.type) && f.type[0] === 'mapper') || cont[1][0]
-      playOutPackets = new Set(Object.values(mapperField.type[1].mappings))
+      for (const [st, spec] of Object.entries(proto || {})) {
+        const cont = spec?.toServer?.types?.packet
+        const mapperField = Array.isArray(cont?.[1])
+          ? (cont[1].find(f => f.type && Array.isArray(f.type) && f.type[0] === 'mapper') || cont[1][0])
+          : null
+        const mappings = mapperField?.type?.[1]?.mappings
+        if (mappings) outPacketsByState.set(st, new Set(Object.values(mappings)))
+      }
     } catch (e) {
       s.log('packet table unavailable, outbound name guard disabled:', e.message)
     }
@@ -233,8 +263,9 @@ class Session {
     const clientWrite = client.write.bind(client)
     client.write = (name, params) => {
       if (!s.backendActionIsCurrent()) return false
-      if (client.state === 'play' && playOutPackets.size > 0 && !playOutPackets.has(name)) {
-        s.log('SKIP unknown outbound packet ' + name + ' (not in ' + (s.bot && s.bot.version) + ' play.toServer)')
+      const allowed = outPacketsByState.get(client.state)
+      if (allowed && allowed.size > 0 && !allowed.has(name)) {
+        s.log('SKIP unknown outbound packet ' + name + ' (not in ' + (s.bot && s.bot.version) + ' ' + client.state + '.toServer)')
         return false
       }
       if (name === 'teleport_confirm') {
@@ -342,7 +373,14 @@ class Session {
       }
     })
     s.bot.recipeBook = new Map()
-    s.bot._client.on('recipe_book_add', p => { for (const e of p.entries) s.bot.recipeBook.set(e.recipe.displayId, e.recipe) })
+    s.bot._client.on('recipe_book_add', p => {
+      if (p.replace) s.bot.recipeBook.clear()
+      for (const e of p.entries || []) s.bot.recipeBook.set(e.recipe.displayId, e.recipe)
+    })
+    s.bot._client.on('recipe_book_remove', p => {
+      for (const id of p.recipeIds || []) s.bot.recipeBook.delete(id)
+    })
+    worldBot.on('login', () => { if (s.bot === worldBot && s.bot.recipeBook) s.bot.recipeBook.clear() })
     // Mineflayer itself does not expose advancements, but minecraft-protocol fully parses this packet.
     // The packet is a full reset on login/server switch, followed by incremental definition/progress updates.
     s.bot._client.on('advancements', p => {
@@ -412,6 +450,7 @@ class Session {
       patchBrokenPickaxeMaterials(s.mcData)
       patchBrokenPickaxeMaterials(s.bot.registry)
       s.bot.pathfinder.goto = createSafeGoto(s.bot)
+      s.bot.pathfinder.bestHarvestTool = block => selectBestHarvestTool(s.bot, block)
       s.bot.pathfinder.setMovements(createMovements(s.bot))
       // 4 s 思考上限（20 ms/tick 约合 1.6 s 纯 A* 算力，足够覆盖 128 格视距），
       // 避免不可达目标白算 15 s 触发 8 s stalled 看门狗或拖死 allow_partial
@@ -555,6 +594,8 @@ class Session {
       s.log('END', r)
       s.pushEvent('disconnected', { reason: r })
       s.bot = null
+      s.usingItem = null
+      s.releaseHeld()
       s.clearPosture()
       if (s.readiness.onEnd) s.readiness.onEnd(r)
       if (s.reconnectPending && !s.destroyed) {
@@ -575,6 +616,8 @@ class Session {
   destroy() {
     this.destroyed = true
     this.reconnectPending = false
+    this.usingItem = null
+    this.releaseHeld()
     if (this.readiness.destroy) this.readiness.destroy()
     if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null }
     if (this.bot) this.bot.quit()
@@ -1111,6 +1154,45 @@ function attackIntervalMs (item) {
 // 所以这里自己按匀加速积分位置，逐帧发 vehicle_move，同时把 bot.entity 一起挪，
 // 免得物理插件用旧坐标把玩家拽回去。
 const VEHICLE_MAX_SPEED = { oak_boat: 8, boat: 8, strider: 4, pig: 5, horse: 9, donkey: 7, mule: 7, skeleton_horse: 9, camel: 6 }
+function itemEnchantments (item) {
+  if (!item) return []
+  const ex = itemExtras(item).enchantments
+  if (ex) return ex.map(e => ({ name: e.name, lvl: e.level }))
+  const raw = item.enchants
+  return Array.isArray(raw) ? raw : []
+}
+
+// 1.21 物品组件附魔版 bestHarvestTool：mineflayer-pathfinder 原版只读旧 nbt.Enchantments（1.21 上恒为空），
+// 导致效率 V 铁镐输给排在前面的白板铁镐。这里直接用组件附魔算 digTime。
+function selectBestHarvestTool (bot, block) {
+  const availableTools = bot.inventory.items()
+  const effects = bot.entity?.effects || {}
+  let fastest = Number.MAX_VALUE
+  let bestCanHarvest = false
+  let bestTool = null
+  for (const tool of availableTools) {
+    const canHarvest = !block.harvestTools || !!block.harvestTools[tool.type]
+    const digTime = block.digTime(tool.type, false, false, false, itemEnchantments(tool), effects)
+    if ((canHarvest && !bestCanHarvest) || (canHarvest === bestCanHarvest && digTime < fastest)) {
+      fastest = digTime
+      bestCanHarvest = canHarvest
+      bestTool = tool
+    }
+  }
+  return bestTool
+}
+
+const WEAPON_BASE_DAMAGE = {
+  wooden_sword: 4, golden_sword: 4, stone_sword: 5, copper_sword: 5, iron_sword: 6, diamond_sword: 7, netherite_sword: 8,
+  wooden_axe: 7, golden_axe: 7, stone_axe: 9, copper_axe: 7, iron_axe: 9, diamond_axe: 9, netherite_axe: 10
+}
+function weaponScore (item) {
+  const base = WEAPON_BASE_DAMAGE[item.name] || 1
+  const sharp = itemEnchantments(item).find(e => e.name === 'sharpness')
+  const dmg = base + (sharp ? 0.5 * sharp.lvl + 0.5 : 0)
+  return dmg * (1000 / attackIntervalMs(item))
+}
+
 async function driveVehicle(s, tx, tz, range, timeout) {
   const b = s.bot
   const first = b.vehicle
@@ -1121,7 +1203,7 @@ async function driveVehicle(s, tx, tz, range, timeout) {
   const DT = 50
   let speed = 0
   let dist = Infinity
-  while (Date.now() - t0 < timeout) {
+  while (Date.now() - t0 < timeout && !s.interruptedBy && s.alive) {
     requireConnected(s, b)
     if (!b.vehicle) fail('dismounted', `no longer riding ${first.name} (vehicle vanished mid-drive)`)
     const p = b.vehicle.position
@@ -1151,6 +1233,9 @@ async function driveVehicle(s, tx, tz, range, timeout) {
     await sleep(DT)
   }
   requireConnected(s, b)
+  if (s.interruptedBy || !s.alive) {
+    return { pos: fmt(b.entity.position), vehicle: b.vehicle ? { id: b.vehicle.id, name: b.vehicle.name } : { name: first.name }, dist: +dist.toFixed(2), ms: Date.now() - t0 }
+  }
   if (dist > range) {
     fail('drive_timeout', `${first.name} did not reach target`, { pos: fmt(b.entity.position), dist: +dist.toFixed(1), started })
   }
@@ -1329,10 +1414,33 @@ async function collectDrops(s, near, radius = 4) {
   }
 }
 
-function movementCoordinate(value, axis) {
-  if (typeof value === 'string' && value.trim()) value = Number(value)
-  if (!Number.isFinite(value)) fail('bad_args', `move_to requires a finite ${axis} coordinate`)
+function strictCoordinate (value, axis, label = 'operation') {
+  if (typeof value === 'boolean' || value === null || value === undefined) {
+    fail('bad_args', `${label} requires a finite ${axis} coordinate`)
+  }
+  if (typeof value === 'string') {
+    if (!value.trim()) fail('bad_args', `${label} requires a finite ${axis} coordinate`)
+    value = Number(value)
+  }
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    fail('bad_args', `${label} requires a finite ${axis} coordinate`)
+  }
   return value
+}
+
+function movementCoordinate(value, axis) {
+  return strictCoordinate(value, axis, 'move_to')
+}
+
+function strictPositiveInt (value, name, max = Infinity) {
+  if (typeof value === 'boolean' || value === null || value === undefined || value === '') {
+    fail('bad_args', `${name} must be a positive integer`)
+  }
+  const n = typeof value === 'string' && value.trim() ? Number(value) : value
+  if (typeof n !== 'number' || !Number.isInteger(n) || n < 1 || n > max) {
+    fail('bad_args', max < Infinity ? `${name} must be an integer between 1 and ${max}` : `${name} must be a positive integer`)
+  }
+  return n
 }
 
 // 对实体右键：无 item 就是"用一下"（上船/上马/村民对话），有 item 就是把物品用在它身上
@@ -1483,7 +1591,8 @@ function seeThroughTable(mcData) {
 async function scanExposed(s, radius, want, max) {
   if (max <= 0) return []
   const bot = s.bot
-  const me = bot.entity.position
+  const rawPos = bot.entity.position
+  const me = typeof rawPos.clone === 'function' ? rawPos.clone() : { x: rawPos.x, y: rawPos.y, z: rawPos.z }
   const see = seeThroughTable(s.mcData)
   const minY = bot.game.minY, maxY = bot.game.minY + bot.game.height - 1
   const cols = new Map()
@@ -1938,13 +2047,15 @@ async function openTarget(s, target) {
     const e = s.bot.entities[target.entity_id]
     if (!e) fail('no_such_entity', `entity ${target.entity_id} not visible`)
     await goNear(s, e.position, 2.5)
-    what = e.name
-    opener = () => s.bot.activateEntity(e)
+    const live = s.bot.entities[target.entity_id]
+    if (!live) fail('no_such_entity', `entity ${target.entity_id} vanished before opening`)
+    what = live.name
+    opener = () => s.bot.activateEntity(live)
   } else {
     let block
     if (target.pos) {
       const [x, y, z] = target.pos
-      block = s.bot.blockAt(new Vec3(x, y, z))
+      block = s.bot.blockAt(new Vec3(strictCoordinate(x, 'x', 'window'), strictCoordinate(y, 'y', 'window'), strictCoordinate(z, 'z', 'window')).floored())
       if (!block) fail('not_loaded', 'chunk not loaded')
     } else if (target.block) {
       if (!s.mcData.blocksByName[target.block]) fail('bad_args', `unknown block ${target.block}`)
@@ -1958,12 +2069,21 @@ async function openTarget(s, target) {
   // 村民的 trade_list 会在 open_window 之后立刻到，先挂监听
   let trades = null, merchant = null
   const onTrades = p => {
-    trades = p.trades.map(t => ({
-      raw: t,
-      cost1: tradeItem(s, t.inputItem1), cost2: t.inputItem2 ? tradeItem(s, t.inputItem2) : null,
-      result: itemSummaryNotch(s, t.outputItem), disabled: t.tradeDisabled, uses: t.nbTradeUses, max_uses: t.maximumNbTradeUses,
-      special_price: t.specialPrice, demand: t.demand, multiplier: t.priceMultiplier
-    }))
+    trades = p.trades.map(t => {
+      const cost1 = tradeItem(s, t.inputItem1)
+      if (cost1) {
+        const itDef = s.mcData.itemsByName[cost1.name]
+        const stackSize = (itDef && itDef.stackSize) || 64
+        const demandDiff = Math.max(0, Math.floor(cost1.count * (t.demand || 0) * (t.priceMultiplier || 0)))
+        cost1.count = Math.min(Math.max(cost1.count + (t.specialPrice || 0) + demandDiff, 1), stackSize)
+      }
+      return {
+        raw: t,
+        cost1, cost2: t.inputItem2 ? tradeItem(s, t.inputItem2) : null,
+        result: itemSummaryNotch(s, t.outputItem), disabled: t.tradeDisabled, uses: t.nbTradeUses, max_uses: t.maximumNbTradeUses,
+        special_price: t.specialPrice, demand: t.demand, multiplier: t.priceMultiplier
+      }
+    })
     merchant = { level: p.villagerLevel, xp: p.experience }
   }
   const props = {}
@@ -1975,12 +2095,20 @@ async function openTarget(s, target) {
   s.bot._client.on('trade_list', onTrades)
   s.bot._client.on('craft_progress_bar', onProp)
   const opened = new Promise((resolve, reject) => {
-    const t = setTimeout(() => { s.bot.removeListener('windowOpen', ok); reject(new ApiError('no_window', `${what} did not open a GUI`)) }, 2500)
-    const ok = w => { clearTimeout(t); resolve(w) }
+    let settled = false
+    const finish = (fn, v) => {
+      if (settled) return
+      settled = true
+      clearTimeout(t)
+      s.bot?.removeListener('windowOpen', ok)
+      fn(v)
+    }
+    const t = setTimeout(() => finish(reject, new ApiError('no_window', `${what} did not open a GUI`)), 2500)
+    const ok = w => finish(resolve, w)
     s.bot.once('windowOpen', ok)
+    Promise.resolve().then(opener).catch(err => finish(reject, err))
   })
   try {
-    opener()
     const w = await opened
     await sleep(350) // 等 window_items / 属性 / 交易列表
     if (w.type === 'minecraft:merchant') for (let i = 0; i < 10 && !trades; i++) await sleep(100)
@@ -2090,9 +2218,10 @@ async function opPut(s, w, kind, { item, count, to, slot, potion, enchanted, cus
   if ((kind.outputs || []).includes(to)) fail('bad_section', `cannot put into output section "${to}"`)
   const it = s.mcData.itemsByName[item]
   if (!it) fail('bad_args', `unknown item ${item}`)
+  const reqCount = count === undefined ? undefined : strictPositiveInt(count, 'count')
   const have = windowInvCounts(w)[item] || 0
   if (!have) fail('missing_item', `no ${item} in inventory`, { inventory: windowInvCounts(w) })
-  let want = Math.min(count ?? have, have)
+  let want = Math.min(reqCount ?? have, have)
   let slots = secs[to]
   if (slot !== undefined) {
     if (!Number.isInteger(slot) || slot < 0 || slot >= slots.length) fail('bad_args', `slot must be 0..${slots.length - 1} for section ${to}`)
@@ -2104,7 +2233,7 @@ async function opPut(s, w, kind, { item, count, to, slot, potion, enchanted, cus
     if (!pick()) fail('missing_item', `no ${item} of ${potion} in inventory`)
     let moved = 0
     for (const dest of slots) {
-      if (moved >= (count ?? 1)) break
+      if (moved >= (reqCount ?? 1)) break
       if (w.slots[dest]) continue
       const src = pick()
       if (!src) break
@@ -2153,15 +2282,50 @@ async function opPut(s, w, kind, { item, count, to, slot, potion, enchanted, cus
 
 // 背包（当前界面里的背包格）还能放下多少个和 x 一模一样的物品。同类但组件不同的堆不算（不会合并），宁少勿多。
 // mineflayer 的 putAway / transfer / putSelectedItemRange 在背包放不下时会把光标上的物品直接扔到地上。
+function itemStackSig (i) {
+  return JSON.stringify([i.nbt ?? null, i.components ?? null])
+}
 function roomFor(w, x) {
-  const sig = i => JSON.stringify([i.nbt ?? null, i.components ?? null])
+  const sig = itemStackSig(x)
   let n = 0
   for (let i = w.inventoryStart; i < w.inventoryEnd; i++) {
     const y = w.slots[i]
     if (!y) n += x.stackSize
-    else if (y.type === x.type && y.count < y.stackSize && sig(y) === sig(x)) n += y.stackSize - y.count
+    else if (y.type === x.type && y.count < y.stackSize && itemStackSig(y) === sig) n += y.stackSize - y.count
   }
   return n
+}
+// 同时放入多组物品（例如村民交易的成品 + 付款槽剩余找零）时，校验背包格是否全部装得下，
+// 防止取走成品占掉最后一个空格后，关窗时服务端把付款槽剩余绿宝石直接扔到地上。
+function canFitItems (w, items) {
+  const sim = []
+  for (let i = w.inventoryStart; i < w.inventoryEnd; i++) {
+    const y = w.slots[i]
+    sim.push(y ? { type: y.type, count: y.count, stackSize: y.stackSize || 64, sig: itemStackSig(y) } : null)
+  }
+  for (const x of items) {
+    if (!x || x.count <= 0) continue
+    let left = x.count
+    const stackSize = x.stackSize || 64
+    const sig = itemStackSig(x)
+    for (const slot of sim) {
+      if (left <= 0) break
+      if (slot && slot.type === x.type && slot.count < slot.stackSize && slot.sig === sig) {
+        const add = Math.min(left, slot.stackSize - slot.count)
+        slot.count += add
+        left -= add
+      }
+    }
+    for (let i = 0; i < sim.length && left > 0; i++) {
+      if (!sim[i]) {
+        const add = Math.min(left, stackSize)
+        sim[i] = { type: x.type, count: add, stackSize, sig }
+        left -= add
+      }
+    }
+    if (left > 0) return false
+  }
+  return true
 }
 
 async function opTake(s, w, kind, { from, item, count }) {
@@ -2208,6 +2372,8 @@ async function opTake(s, w, kind, { from, item, count }) {
 
 async function opSelect(s, w, kind, { option, times = 1 }) {
   if (!kind.select) fail('bad_args', `${shortType(w.type)} has no selectable options`)
+  if (!Number.isInteger(option) || option < 0) fail('bad_args', 'option must be a non-negative integer')
+  times = strictPositiveInt(times, 'times', 64)
   // 附魔台放入物品后，三个选项要等服务器算完再推过来
   if (w.type === 'minecraft:enchantment') for (let i = 0; i < 20 && !((w.props || {})[option] > 0); i++) await sleep(100)
   const opts = kind.options ? kind.options(s, w, w.props || {}) : null
@@ -2218,31 +2384,57 @@ async function opSelect(s, w, kind, { option, times = 1 }) {
   // mineflayer 在村民界面点击槽位时会读 window.selectedTrade（平时由它自己的 villager 插件设置）
   if (w.type === 'minecraft:merchant') w.selectedTrade = mineflayerTrade(s, w.trades[option])
   const results = []
-  for (let n = 0; n < times; n++) {
-    // 村民：付款槽还够下一次时，服务器会直接把成品放好，不用再选一次
-    if (!(w.type === 'minecraft:merchant' && n > 0 && w.slots[2])) {
-      const watch = (kind.selectWatch || []).map(i => once(w, `updateSlot:${i}`, 2000))
-      kind.select(s, w, option)
-      await Promise.all(watch)
-      await sleep(200)
-    }
-    if (w.type === 'minecraft:merchant') {
-      // 选交易后服务器自动把付款放进 0/1 号槽，成品出现在 2 号槽，取走才算完成一次
-      if (!w.slots[2]) { if (n === 0) fail('option_unavailable', 'trade produced no result (not enough payment?)'); break }
-      results.push(await opTake(s, w, kind, { from: 'output' }))
-      if (w.trades && w.trades[option]) {
-        const t = w.trades[option]
-        t.uses++
-        if (t.uses >= t.max_uses) t.disabled = true
-        w.selectedTrade = mineflayerTrade(s, t)
-        if (t.disabled || !hasItems(s, w, [t.cost1, t.cost2].filter(Boolean))) { n = times } // 用完次数或付不起，提前结束
+  try {
+    for (let n = 0; n < times && !s.interruptedBy && s.alive; n++) {
+      // 村民：付款槽还够下一次时，服务器会直接把成品放好，不用再选一次
+      if (!(w.type === 'minecraft:merchant' && n > 0 && w.slots[2])) {
+        const watch = (kind.selectWatch || []).map(i => once(w, `updateSlot:${i}`, 2000))
+        kind.select(s, w, option)
+        await Promise.all(watch)
+        await sleep(200)
       }
-    } else if (w.type === 'minecraft:enchantment') {
-      results.push({ enchanted: w.slots[0] && w.slots[0].name, enchantments: w.slots[0] ? itemExtras(w.slots[0]).enchantments || [] : null, xp_level: s.bot.experience.level })
-    } else results.push({ selected: option })
+      if (w.type === 'minecraft:merchant') {
+        // 选交易后服务器自动把付款放进 0/1 号槽，成品出现在 2 号槽，取走才算完成一次
+        if (!w.slots[2]) { if (n === 0) fail('option_unavailable', 'trade produced no result (not enough payment?)'); break }
+        const t = w.trades && w.trades[option]
+        const needed = [w.slots[2]]
+        if (w.slots[0]) {
+          const rem0 = w.slots[0].count - (t?.cost1?.count || 0)
+          if (rem0 > 0) needed.push({ ...w.slots[0], count: rem0 })
+        }
+        if (w.slots[1]) {
+          const rem1 = w.slots[1].count - (t?.cost2?.count || 0)
+          if (rem1 > 0) needed.push({ ...w.slots[1], count: rem1 })
+        }
+        if (!canFitItems(w, needed)) {
+          if (results.length > 0) break
+          fail('inventory_full', `no room in the inventory for ${w.slots[2].count} ${w.slots[2].name} plus payment change; free a slot first (nothing was moved)`)
+        }
+        results.push(await opTake(s, w, kind, { from: 'output' }))
+        if (t) {
+          t.uses++
+          if (t.uses >= t.max_uses) t.disabled = true
+          w.selectedTrade = mineflayerTrade(s, t)
+          if (t.disabled || !hasItems(s, w, [t.cost1, t.cost2].filter(Boolean))) { n = times } // 用完次数或付不起，提前结束
+        }
+      } else if (w.type === 'minecraft:enchantment') {
+        results.push({ enchanted: w.slots[0] && w.slots[0].name, enchantments: w.slots[0] ? itemExtras(w.slots[0]).enchantments || [] : null, xp_level: s.bot.experience.level })
+      } else results.push({ selected: option })
+    }
+  } finally {
+    // 交易完（或提前中止/报错）把留在付款槽的物品按背包剩余空间安全退回，避免界面关闭时被服务端扔到地上
+    if (w.type === 'minecraft:merchant' && s.bot) {
+      for (const i of [0, 1]) {
+        const cur = w.slots[i]
+        if (!cur) continue
+        const room = roomFor(w, cur)
+        if (room <= 0) continue
+        if (room >= cur.count) await s.bot.putAway(i).catch(() => {})
+        else await s.bot.transfer({ window: w, itemType: cur.type, metadata: null, sourceStart: i, sourceEnd: i + 1, destStart: w.inventoryStart, destEnd: w.inventoryEnd, count: room }).catch(() => {})
+        await sleep(100)
+      }
+    }
   }
-  // 交易完把留在付款槽的物品退回背包，避免界面关闭时掉出
-  if (w.type === 'minecraft:merchant') for (const i of [0, 1]) if (w.slots[i]) { await s.bot.putAway(i).catch(() => {}); await sleep(100) }
   return { selected: option, times: results.length, results }
 }
 
@@ -2291,33 +2483,58 @@ async function craftManually(s, it, count, table, known) {
   const before = invCounts(s.bot)[it.name] || 0
   const gridW = table ? 3 : 2
   let full = false
-  for (let round = 0; round < 64 && (invCounts(s.bot)[it.name] || 0) - before < count; round++) {
+  for (let round = 0; round < 64 && !s.interruptedBy && s.alive && (invCounts(s.bot)[it.name] || 0) - before < count; round++) {
+    requireConnected(s)
     const recipe = s.bot.recipesFor(it.id, null, 1, table)[0]
     if (!recipe) break
     const win = table ? await openTable(s, table) : s.bot.inventory
     const gridSize = gridW * gridW
     const invStart = table ? win.inventoryStart : 9
+    const invEnd = table ? win.inventoryEnd : 45
+    let lastSrc = -1
     try {
       const cells = []
       if (recipe.inShape) recipe.inShape.forEach((row, r) => row.forEach((ing, c) => { if (ing && ing.id !== -1) cells.push([1 + r * gridW + c, ing.id]) }))
       else recipe.ingredients.forEach((ing, i) => cells.push([1 + i, ing.id]))
       for (const [gridSlot, id] of cells) {
-        const src = win.slots.findIndex((si, i) => i >= invStart && si && si.type === id)
+        if (s.interruptedBy || !s.alive) break
+        const src = win.slots.findIndex((si, i) => i >= invStart && i < invEnd && si && si.type === id)
         if (src < 0) fail('missing_ingredients', `ran out of ${s.mcData.items[id].name}`, { example_recipe_needs: missingIngredients(s, recipe), inventory: invCounts(s.bot) })
+        lastSrc = src
         await s.bot.clickWindow(src, 0, 0); await sleep(120)
         await s.bot.clickWindow(gridSlot, 1, 0); await sleep(120)
         await s.bot.clickWindow(src, 0, 0); await sleep(120)
+        lastSrc = -1
       }
-      for (let i = 0; i < 10 && !win.slots[0]; i++) await sleep(100)
+      if (s.interruptedBy || !s.alive) break
+      for (let i = 0; i < 10 && !win.slots[0] && !s.interruptedBy; i++) await sleep(100)
+      if (s.interruptedBy || !s.alive) break
       if (!win.slots[0] || win.slots[0].type !== it.id) break
       if (!await takeCraftResult(s, win, it.id)) { full = true; break }
     } finally {
-      for (let sl = 1; sl <= gridSize; sl++) if (win.slots[sl]) { await s.bot.clickWindow(sl, 0, 1).catch(() => {}); await sleep(80) }
-      if (table) s.bot.closeWindow(win)
+      if (s.bot) {
+        // 先把光标上可能悬空的整组材料放回原槽或空位，避免关窗时被服务端扔到地上
+        if (win.selectedItem) {
+          const fallbackSlot = (lastSrc >= invStart && lastSrc < invEnd && (!win.slots[lastSrc] || win.slots[lastSrc].type === win.selectedItem.type))
+            ? lastSrc
+            : win.slots.findIndex((si, i) => i >= invStart && i < invEnd && !si)
+          if (fallbackSlot >= 0) {
+            await s.bot.clickWindow(fallbackSlot, 0, 0).catch(() => {})
+            await sleep(80)
+          }
+          if (win.selectedItem && roomFor(win, win.selectedItem) >= win.selectedItem.count) {
+            await s.bot.putSelectedItemRange(invStart, invEnd, win, null).catch(() => {})
+            await sleep(80)
+          }
+        }
+        for (let sl = 1; sl <= gridSize; sl++) if (win.slots[sl]) { await s.bot.clickWindow(sl, 0, 1).catch(() => {}); await sleep(80) }
+        if (table && s.bot.currentWindow === win) s.bot.closeWindow(win)
+      }
     }
   }
-  if (!full) await sleep(1500)
+  if (!full && !s.interruptedBy && s.alive) await sleepInterruptible(s, 1500)
   const made = (invCounts(s.bot)[it.name] || 0) - before
+  if (s.interruptedBy || !s.alive) return made > 0 ? { crafted: it.name, gained: made, used_table: !!table, method: 'manual', inventory: invCounts(s.bot) } : {}
   if (full && made < count) failInventoryFull(s, it.name, made)
   if (made <= 0) fail('missing_ingredients', `could not craft ${it.name}`, { example_recipe_needs: missingIngredients(s, known[0]), inventory: invCounts(s.bot) })
   return { crafted: it.name, gained: made, used_table: !!table, method: 'manual', inventory: invCounts(s.bot) }
@@ -2431,20 +2648,28 @@ const api = {
     const summary = {}
     for (const [x, y, z, d, v] of pts) {
       const n = stateBlock[v].name
-      const p = { x, y, z }
-      const rec = summary[n] || (summary[n] = { count: 0, nearest: null, dist: 1e9 })
+      const rec = summary[n] || (summary[n] = { count: 0, nearest: null, rawDist: Infinity })
       rec.count++
-      if (d < rec.dist) { rec.dist = +d.toFixed(1); rec.nearest = [p.x, p.y, p.z] }
+      if (d < rec.rawDist) { rec.rawDist = d; rec.nearest = [x, y, z] }
     }
-    return { radius, scanned: pts.length, blocks: Object.fromEntries(Object.entries(summary).sort((a, b) => a[1].dist - b[1].dist)) }
+    const blocks = Object.fromEntries(
+      Object.entries(summary)
+        .sort((a, b) => a[1].rawDist - b[1].rawDist)
+        .map(([n, rec]) => [n, { count: rec.count, nearest: rec.nearest, dist: +rec.rawDist.toFixed(1) }])
+    )
+    return { radius, scanned: pts.length, blocks }
   },
   async get_entities(s, { radius = 32, types }) {
     if (!s.bot || !s.bot.entity) fail('not_connected', 'bot not connected')
+    if (types !== undefined && types !== null && !Array.isArray(types)) fail('bad_args', 'types must be an array of entity names or types')
+    const hasTypes = Array.isArray(types) && types.length > 0
+    radius = Number(radius)
+    if (!Number.isFinite(radius) || radius <= 0) fail('bad_args', 'radius must be a positive number')
     const me = s.bot.entity.position
     return {
       entities: Object.values(s.bot.entities)
         .filter(e => e !== s.bot.entity && e.position.distanceTo(me) <= radius)
-        .filter(e => !types || types.includes(e.name) || types.includes(e.type))
+        .filter(e => !hasTypes || types.includes(e.name) || types.includes(e.type))
         .sort((a, b) => a.position.distanceTo(me) - b.position.distanceTo(me))
         .slice(0, 40)
         .map(e => {
@@ -2499,14 +2724,14 @@ const api = {
   },
   async get_block(s, { x, y, z }) {
     if (!s.bot) fail('not_connected', 'bot not connected')
-    // 之前直接把 undefined/NaN 丢给 blockAt，结果 null 被报成 not_loaded，误导调用方
-    const nums = [x, y, z].map(Number)
-    if (nums.some(n => !Number.isFinite(n))) fail('bad_args', 'x, y, z must be finite numbers (or pass pos:[x,y,z])')
-    const [bx, by, bz] = nums
-    const b = s.bot.blockAt(new Vec3(bx, by, bz))
+    // 严格校验坐标：拒绝 undefined / null / "" / boolean / NaN，避免静默转成 0 或误报 not_loaded
+    const bx = strictCoordinate(x, 'x', 'get_block')
+    const by = strictCoordinate(y, 'y', 'get_block')
+    const bz = strictCoordinate(z, 'z', 'get_block')
+    const b = s.bot.blockAt(new Vec3(bx, by, bz).floored())
     if (!b) fail('not_loaded', 'chunk not loaded')
     const props = blockProps(b)
-    return { name: b.name, pos: [bx, by, bz], properties: props, ...cropInfo(s, b, props), diggable: b.diggable, hardness: b.hardness, harvest_tool_ok: s.bot.canDigBlock(b) }
+    return { name: b.name, pos: [Math.floor(bx), Math.floor(by), Math.floor(bz)], properties: props, ...cropInfo(s, b, props), diggable: b.diggable, hardness: b.hardness, harvest_tool_ok: s.bot.canDigBlock(b) }
   },
 
   // ---------- actions ----------
@@ -2620,7 +2845,11 @@ const api = {
   },
   async dig(s, { x, y, z, collect = true }) {
     if (!s.bot) fail('not_connected', 'bot not connected')
-    const p = new Vec3(x, y, z)
+    const p = new Vec3(
+      strictCoordinate(x, 'x', 'dig'),
+      strictCoordinate(y, 'y', 'dig'),
+      strictCoordinate(z, 'z', 'dig')
+    ).floored()
     const block = s.bot.blockAt(p)
     if (!block) fail('not_loaded', 'chunk not loaded')
     if (block.name.endsWith('air') || block.boundingBox === 'empty' && !block.name.includes('grass') && !block.name.includes('flower')) {
@@ -2628,7 +2857,7 @@ const api = {
     }
     if (!block.diggable) fail('undiggable', `${block.name} is not diggable`)
     await goNear(s, p, 3.5, 60000, 5.0)
-    const best = s.bot.pathfinder.bestHarvestTool(block)
+    const best = selectBestHarvestTool(s.bot, block)
     const tool = best && /_(pickaxe|axe|shovel|hoe|sword)$|^shears$/.test(best.name) ? best : null
     if (tool) await s.bot.equip(tool, 'hand')
     // 空手挖：背包没有空格时 mineflayer 的 unequip('hand') 会把手上整组扔到地上（实测 64 钻石），这时就拿着它挖
@@ -2646,7 +2875,10 @@ const api = {
     const t0 = Date.now()
     let after
     try {
-      await withTimeout(s.bot.dig(block, true), 30000, 'dig').catch(e => { if (!s.interruptedBy) throw e })
+      await withTimeout(s.bot.dig(block, true), 30000, 'dig').catch(e => {
+        if (s.bot && s.bot.targetDigBlock) { try { s.bot.stopDigging() } catch {} }
+        if (!s.interruptedBy) throw e
+      })
       if (s.interruptedBy) return {}
       // 服务端判定挖得"太快"时会延后补完（还要几 tick），再加上来回延迟
       const ping = (s.bot.player && s.bot.player.ping) || 0
@@ -2654,6 +2886,7 @@ const api = {
       while (Date.now() < deadline && (watch.state === null || watch.state === block.stateId)) await sleep(25)
       after = watch.state
     } finally {
+      if (s.bot && s.bot.targetDigBlock) { try { s.bot.stopDigging() } catch {} }
       watch.stop()
     }
     const digMs = Date.now() - t0
@@ -2672,12 +2905,17 @@ const api = {
   },
   async place(s, { item, x, y, z }) {
     if (!s.bot) fail('not_connected', 'bot not connected')
-    if (x === undefined) {
+    if (x === undefined && y === undefined && z === undefined) {
       const site = autoPlaceSite(s)
       if (!site) fail('no_support', 'no free spot with solid ground within 3 blocks')
       ;({ x, y, z } = site)
     }
-    const target = new Vec3(x, y, z)
+    const target = new Vec3(
+      strictCoordinate(x, 'x', 'place'),
+      strictCoordinate(y, 'y', 'place'),
+      strictCoordinate(z, 'z', 'place')
+    ).floored()
+    x = target.x; y = target.y; z = target.z
     const cur = s.bot.blockAt(target)
     if (cur && cur.boundingBox !== 'empty') fail('occupied', `${cur.name} already at target`)
     const it = findItem(s, item)
@@ -2720,7 +2958,7 @@ const api = {
         }
       }
     } finally {
-      s.bot.setControlState('sneak', !!s.posture.sneak)
+      if (s.bot) { try { s.bot.setControlState('sneak', !!s.posture.sneak) } catch {} }
     }
     await sleep(250)
     const now = s.bot.blockAt(target)
@@ -2731,7 +2969,11 @@ const api = {
   async interact(s, { x, y, z, entity_id, item }) {
     if (!s.bot) fail('not_connected', 'bot not connected')
     if (entity_id !== undefined) return await interactEntity(s, entity_id, item)
-    const p = new Vec3(x, y, z)
+    const p = new Vec3(
+      strictCoordinate(x, 'x', 'interact'),
+      strictCoordinate(y, 'y', 'interact'),
+      strictCoordinate(z, 'z', 'interact')
+    ).floored()
     const block = s.bot.blockAt(p)
     if (!block) fail('not_loaded', 'chunk not loaded')
     await goNear(s, p, 3)
@@ -2770,11 +3012,11 @@ const api = {
     const upAfter = s.bot.blockAt(above)
     const used = {}
     for (const [k, v] of Object.entries(invBefore)) { const d = v - (invCounts(s.bot)[k] || 0); if (d > 0) used[k] = d }
-    const changed = aft.stateId !== block.stateId || (upAfter && upBefore && upAfter.stateId !== upBefore.stateId)
-    const props = blockProps(aft)
+    const changed = !aft || aft.stateId !== block.stateId || (upAfter && upBefore && upAfter.stateId !== upBefore.stateId)
+    const props = aft ? blockProps(aft) : null
     return {
       block: block.name, before: blockProps(block),
-      after: { name: aft.name, properties: props, ...cropInfo(s, aft, props) },
+      after: aft ? { name: aft.name, properties: props, ...cropInfo(s, aft, props) } : null,
       ...(upAfter && upBefore && upAfter.stateId !== upBefore.stateId ? { above: { before: upBefore.name, after: upAfter.name, properties: blockProps(upAfter) } } : {}),
       changed, ...(Object.keys(used).length ? { used } : {})
     }
@@ -2793,7 +3035,7 @@ const api = {
     if (typeof feedback !== 'boolean') fail('bad_args', 'feedback must be a boolean')
     if (timeout !== undefined && (!Number.isFinite(timeout) || timeout < 50 || timeout > 60000)) fail('bad_args', 'timeout must be between 50 and 60000')
     const effTimeout = timeout === undefined ? (chase ? 20000 : 1500) : timeout
-    const weapon = bot.inventory.items().filter(i => /_sword$|_axe$/.test(i.name)).sort((a, b) => (b.name.includes('sword') - a.name.includes('sword')))[0]
+    const weapon = bot.inventory.items().filter(i => /_sword$|_axe$/.test(i.name)).sort((a, b) => weaponScore(b) - weaponScore(a))[0]
     if (weapon) await bot.equip(weapon, 'hand')
     requireConnected(s, bot)
     const interval = interval_ms ?? attackIntervalMs(bot.heldItem)
@@ -2905,7 +3147,7 @@ const api = {
     weapon = item.name
 
     if (weapon === 'bow' && !hasArrow(s.bot)) fail('missing_ammo', 'bow needs an arrow')
-    if (weapon === 'crossbow' && !hasArrow(s.bot) && !s.bot.inventory.items().some(i => i.name === 'firework_rocket')) {
+    if (weapon === 'crossbow' && !crossbowLoaded(item) && !hasArrow(s.bot) && !s.bot.inventory.items().some(i => i.name === 'firework_rocket')) {
       fail('missing_ammo', 'crossbow needs an arrow or firework rocket')
     }
     charge_ms = charge_ms === undefined ? PROJECTILE_PHYSICS[weapon].charge_ms : Number(charge_ms)
@@ -2932,30 +3174,44 @@ const api = {
     const before = invCounts(s.bot)
     const knownEntities = new Set(Object.keys(s.bot.entities))
     const healthBefore = entity && Number.isFinite(entity.health) ? entity.health : null
+    const shootBot = s.bot
     try {
       if (weapon === 'crossbow') {
-        if (!crossbowLoaded(s.bot.heldItem)) {
-          s.bot.activateItem()
-          await sleep(charge_ms)
-          s.bot.deactivateItem()
-          await sleep(200)
+        if (!crossbowLoaded(shootBot.heldItem)) {
+          shootBot.activateItem()
+          const ok = await sleepInterruptible(s, charge_ms, shootBot)
+          try { shootBot.deactivateItem() } catch {}
+          if (!ok) return {}
+          if (!await sleepInterruptible(s, 200, shootBot)) return {}
         }
-        aim = projectileAim(s.bot, targetPoint(), physics, entity && entity.velocity)
-        await s.bot.look(aim.yaw, aim.pitch, true)
-        s.bot.activateItem()
-        await sleep(150)
-        s.bot.deactivateItem()
+        requireConnected(s, shootBot)
+        if (s.interruptedBy || !s.alive) return {}
+        aim = projectileAim(shootBot, targetPoint(), physics, entity && entity.velocity)
+        await shootBot.look(aim.yaw, aim.pitch, true)
+        requireConnected(s, shootBot)
+        if (s.interruptedBy || !s.alive) return {}
+        shootBot.activateItem()
+        await sleepInterruptible(s, 150, shootBot)
+        try { shootBot.deactivateItem() } catch {}
       } else {
-        s.bot.activateItem()
-        await sleep(charge_ms)
-        aim = projectileAim(s.bot, targetPoint(), physics, entity && entity.velocity)
-        await s.bot.look(aim.yaw, aim.pitch, true)
-        s.bot.deactivateItem()
+        shootBot.activateItem()
+        const ok = await sleepInterruptible(s, charge_ms, shootBot)
+        if (!ok) return {}
+        requireConnected(s, shootBot)
+        aim = projectileAim(shootBot, targetPoint(), physics, entity && entity.velocity)
+        await shootBot.look(aim.yaw, aim.pitch, true)
+        requireConnected(s, shootBot)
+        if (s.interruptedBy || !s.alive) return {}
+        shootBot.deactivateItem()
       }
     } finally {
-      try { s.bot.deactivateItem() } catch {}
+      if (s.bot === shootBot && shootBot._client?.state === 'play') {
+        try { shootBot.deactivateItem() } catch {}
+      }
     }
-    await sleep(500)
+    if (s.interruptedBy || !s.alive) return {}
+    await sleepInterruptible(s, 500, shootBot)
+    if (s.interruptedBy || !s.alive) return {}
 
     const projectiles = Object.entries(s.bot.entities)
       .filter(([id, e]) => !knownEntities.has(id) && /arrow|trident|firework_rocket/.test(e.name || ''))
@@ -2980,9 +3236,13 @@ const api = {
     if (!s.bot) fail('not_connected', 'bot not connected')
     const it = s.mcData.itemsByName[item]
     if (!it) fail('bad_args', `unknown item ${item}`)
+    count = strictPositiveInt(count, 'count')
     const known = s.bot.recipesAll(it.id, null, true)
     if (!known.length) fail('no_recipe', `${item} has no crafting recipe`)
-    const entries = [...s.bot.recipeBook.entries()].filter(([, r]) => r.display?.data?.result?.data?.itemId === it.id)
+    const entries = [...s.bot.recipeBook.entries()].filter(([, r]) =>
+      ['crafting_shaped', 'crafting_shapeless'].includes(r.display?.type) &&
+      r.display?.data?.result?.data?.itemId === it.id
+    )
     const needsTable = !s.bot.recipesAll(it.id, null, null).length
     let table = null
     if (needsTable) {
@@ -2995,23 +3255,27 @@ const api = {
     let made = 0
     let lastErr = null
     let full = false
-    for (let round = 0; made < count && round < 64 && !full; round++) {
+    for (let round = 0; made < count && round < 64 && !full && !s.interruptedBy && s.alive; round++) {
       let gotOne = false
       for (const [displayId, r] of entries) {
+        if (s.interruptedBy || !s.alive) break
         const win = table ? await openTable(s, table) : null
         const windowId = win ? win.id : 0
         const resultSlots = () => (win || s.bot.inventory).slots[0]
         try {
           s.bot._client.write('craft_recipe_request', { windowId, recipeId: displayId, makeAll: false })
-          for (let i = 0; i < 10 && !resultSlots(); i++) await sleep(100)
+          for (let i = 0; i < 10 && !resultSlots() && !s.interruptedBy; i++) await sleep(100)
+          if (s.interruptedBy || !s.alive) break
           const res = resultSlots()
           if (res && res.type === it.id) {
             if (await takeCraftResult(s, win || s.bot.inventory, it.id)) gotOne = true
             else full = true
           } else lastErr = 'server placed no result'
         } finally {
-          if (win) s.bot.closeWindow(win)
-          else for (let sl = 1; sl <= 4; sl++) if (s.bot.inventory.slots[sl]) await s.bot.clickWindow(sl, 0, 1).catch(() => {})
+          if (s.bot) {
+            if (win && s.bot.currentWindow === win) s.bot.closeWindow(win)
+            else if (!win) for (let sl = 1; sl <= 4; sl++) if (s.bot.inventory.slots[sl]) await s.bot.clickWindow(sl, 0, 1).catch(() => {})
+          }
           await sleep(150)
         }
         if (gotOne || full) break
@@ -3019,6 +3283,7 @@ const api = {
       made = (invCounts(s.bot)[item] || 0) - before
       if (!gotOne) break
     }
+    if (s.interruptedBy || !s.alive) return made > 0 ? { crafted: item, gained: made, used_table: !!table, inventory: invCounts(s.bot) } : {}
     if (full) failInventoryFull(s, item, made)
     if (made <= 0) {
       const r = known[0]
@@ -3057,7 +3322,7 @@ const api = {
           done.push({ op: o.op, ...(await WINDOW_OPS[o.op](s, w, kind, o)) })
         } catch (e) {
           if (!(e instanceof ApiError)) e = new ApiError('window_op_failed', e.message)
-          e.extra = { ...(e.extra || {}), failed_op: i, done, window: s.bot.currentWindow === w ? describeWindow(s, w) : null }
+          e.extra = { ...(e.extra || {}), failed_op: i, done, window: s.bot && s.bot.currentWindow === w ? describeWindow(s, w) : null }
           throw e
         }
       }
@@ -3104,12 +3369,16 @@ const api = {
     if (item === 'shield') {
       if (!s.bot.inventory.slots[45] || s.bot.inventory.slots[45].name !== 'shield') await s.bot.equip(it, 'off-hand')
       const hold = Math.max(0, Math.min(Number(ms) || 1000, 10000))
-      s.usingItem = { name: 'shield', t: Date.now() }
-      s.bot.activateItem(true)
-      await sleep(hold)
-      try { s.bot.deactivateItem() } catch {}
-      s.usingItem = null
-      return { used: { name: 'shield', count: 0 }, blocked_ms: hold }
+      const t0 = Date.now()
+      s.usingItem = { name: 'shield', t: t0 }
+      try {
+        s.bot.activateItem(true)
+        await sleepInterruptible(s, hold)
+      } finally {
+        if (s.bot && s.bot._client?.state === 'play') { try { s.bot.deactivateItem() } catch {} }
+        s.usingItem = null
+      }
+      return { used: { name: 'shield', count: 0 }, blocked_ms: Math.min(hold, Date.now() - t0) }
     }
 
     if (!held() || held().name !== item) await s.bot.equip(it, dest)
@@ -3120,11 +3389,14 @@ const api = {
       const countBefore = (held() && held().count) || 0
       const knownEntities = new Set(Object.keys(s.bot.entities))
       s.usingItem = { name: item, t: Date.now() }
-      s.bot.activateItem(dest === 'off-hand')
-      await sleep(200)
-      try { s.bot.deactivateItem() } catch {}
-      s.usingItem = null
-      await sleep(item === 'ender_pearl' ? 1500 : 400)
+      try {
+        s.bot.activateItem(dest === 'off-hand')
+        await sleepInterruptible(s, 200)
+      } finally {
+        if (s.bot && s.bot._client?.state === 'play') { try { s.bot.deactivateItem() } catch {} }
+        s.usingItem = null
+      }
+      if (!await sleepInterruptible(s, item === 'ender_pearl' ? 1500 : 400)) return { used: { name: item, count: 1 }, thrown: true }
       const left = held() && held().name === item ? held().count : 0
       const out = { used: { name: item, count: Math.max(1, countBefore - left) }, thrown: true }
       if (item === 'ender_pearl') {
@@ -3134,7 +3406,7 @@ const api = {
       if (item === 'ender_eye') {
         // 末影之眼会被服务端当成实体下发，等它出现再读飞行方向
         let eye = null
-        for (let i = 0; i < 20 && !eye; i++) {
+        for (let i = 0; i < 20 && !eye && !s.interruptedBy && s.alive; i++) {
           eye = Object.values(s.bot.entities)
             .filter(x => !knownEntities.has(String(x.id)) && x !== s.bot.entity)
             .sort((a, b) => a.position.distanceTo(s.bot.entity.position) - b.position.distanceTo(s.bot.entity.position))[0]
@@ -3163,6 +3435,7 @@ const api = {
       const invBefore = invCounts(s.bot)
       const t0 = Date.now()
       const maxWait = Math.max(5000, Math.min(Number(timeout) || 30000, 60000))
+      const offhand = dest === 'off-hand'
       const wet = p => [0, -0.3].some(dy => {
         const b = s.bot.blockAt(p.offset(0, dy, 0))
         return !!b && (b.name === 'water' || b.name === 'bubble_column' || (b.getProperties && b.getProperties().waterlogged === true))
@@ -3173,22 +3446,32 @@ const api = {
         return out
       }
       const reel = async () => {
-        s.bot.activateItem(false)   // 收竿
-        await sleep(1500)
+        if (!s.bot) return
+        s.bot.activateItem(offhand)   // 收竿
+        if (!await sleepInterruptible(s, 1500)) {
+          if (s.bot && s.bot._client?.state === 'play') { try { s.bot.deactivateItem() } catch {} }
+          return
+        }
         try { s.bot.deactivateItem() } catch {}
-        await sleep(1200)
+        await sleepInterruptible(s, 1200)
       }
       s.usingItem = { name: 'fishing_rod', t: t0 }
       let casts = 0, falseBites = 0, lastInfo = {}
       try {
-        while (Date.now() - t0 < maxWait - 3000 && !s.interruptedBy) {
+        while (Date.now() - t0 < maxWait - 3000 && !s.interruptedBy && s.alive) {
+          requireConnected(s)
           casts++
           const beforeIds = new Set(Object.values(s.bot.entities).map(e => e.id))
-          s.bot.activateItem(false)
+          s.bot.activateItem(offhand)
           let bobber = null
-          for (let i = 0; i < 40 && !bobber; i++) {
+          for (let i = 0; i < 40 && !bobber && !s.interruptedBy && s.alive; i++) {
             await sleep(100)
+            if (!s.bot) break
             bobber = Object.values(s.bot.entities).find(e => !beforeIds.has(e.id) && /bobber/.test(e.name || ''))
+          }
+          if (s.interruptedBy || !s.alive) {
+            if (bobber && s.bot) { try { s.bot.activateItem(offhand) } catch {} }
+            break
           }
           if (!bobber) {
             try { s.bot.deactivateItem() } catch {}
@@ -3201,9 +3484,9 @@ const api = {
           const castAt = Date.now()
           let wetRun = 0, bite = false, refY = null
           const recent = []
-          while (Date.now() - t0 < maxWait) {
+          while (Date.now() - t0 < maxWait && !s.interruptedBy && s.alive) {
             await sleep(100)
-            if (!s.bot.entities[bobber.id]) break
+            if (!s.bot || !s.bot.entities[bobber.id]) break
             const y = bobber.position.y
             if (wetRun < 5) {
               wetRun = wet(bobber.position) ? wetRun + 1 : 0
@@ -3217,8 +3500,9 @@ const api = {
             recent.push(y)
             if (recent.length > 10) recent.shift()
           }
-          lastInfo = { bobber_y: +bobber.position.y.toFixed(2), base_y: refY === null ? null : +refY.toFixed(2), in_water: wet(bobber.position) }
+          lastInfo = { bobber_y: +bobber.position.y.toFixed(2), base_y: refY === null ? null : +refY.toFixed(2), in_water: s.bot ? wet(bobber.position) : false }
           await reel()
+          if (s.interruptedBy || !s.alive) break
           const caught = caughtNow()
           if (Object.keys(caught).length) {
             return { used: { name: 'fishing_rod', count: 0 }, caught, wait_ms: Date.now() - t0, casts, false_bites: falseBites }
@@ -3226,29 +3510,37 @@ const api = {
           if (bite) falseBites++
         }
       } finally {
-        try { s.bot.deactivateItem() } catch {}
+        if (s.bot && s.bot._client?.state === 'play') { try { s.bot.deactivateItem() } catch {} }
         s.usingItem = null
       }
-      fail('timeout', s.interruptedBy ? `nothing caught before the ${s.interruptedBy} interruption (${Date.now() - t0}ms)` : `nothing caught within ${maxWait}ms`, { casts, false_bites: falseBites, waited_ms: Date.now() - t0, ...lastInfo })
+      if (s.interruptedBy || !s.alive) return {}
+      fail('timeout', `nothing caught within ${maxWait}ms`, { casts, false_bites: falseBites, waited_ms: Date.now() - t0, ...lastInfo })
     }
 
     // 望远镜：保持 ms，配合 target 看向目标
     if (item === 'spyglass') {
       const hold = Math.max(100, Math.min(Number(ms) || 800, 5000))
-      s.usingItem = { name: 'spyglass', t: Date.now() }
-      s.bot.activateItem(dest === 'off-hand')
-      await sleep(hold)
-      try { s.bot.deactivateItem() } catch {}
-      s.usingItem = null
-      return { used: { name: 'spyglass', count: 0 }, observed_ms: hold, ...(target && target.entity_id !== undefined ? { target: target.entity_id } : {}) }
+      const t0 = Date.now()
+      s.usingItem = { name: 'spyglass', t: t0 }
+      try {
+        s.bot.activateItem(dest === 'off-hand')
+        await sleepInterruptible(s, hold)
+      } finally {
+        if (s.bot && s.bot._client?.state === 'play') { try { s.bot.deactivateItem() } catch {} }
+        s.usingItem = null
+      }
+      return { used: { name: 'spyglass', count: 0 }, observed_ms: Math.min(hold, Date.now() - t0), ...(target && target.entity_id !== undefined ? { target: target.entity_id } : {}) }
     }
 
     if (item === 'goat_horn') {
       s.usingItem = { name: 'goat_horn', t: Date.now() }
-      s.bot.activateItem(dest === 'off-hand')
-      await sleep(1200)
-      try { s.bot.deactivateItem() } catch {}
-      s.usingItem = null
+      try {
+        s.bot.activateItem(dest === 'off-hand')
+        await sleepInterruptible(s, 1200)
+      } finally {
+        if (s.bot && s.bot._client?.state === 'play') { try { s.bot.deactivateItem() } catch {} }
+        s.usingItem = null
+      }
       return { used: { name: 'goat_horn', count: 0 } }
     }
 
@@ -3262,18 +3554,25 @@ const api = {
       const before = held() ? { name: held().name, count: held().count } : null
       const healthBefore = s.bot.health
       const foodBefore = s.bot.food
-      s.usingItem = { name: item, t: Date.now() }
-      s.bot.activateItem(dest === 'off-hand')
       const t0 = Date.now()
+      const eatLimit = Math.min(Number(timeout) || 8000, 8000)
       let done = false
-      while (Date.now() - t0 < Math.min(Number(timeout) || 8000, 8000)) {
-        await sleep(100)
-        const cur = held()
-        if (!before) { done = true; break }
-        if (!cur || cur.name !== before.name || cur.count < before.count) { done = true; break }
+      s.usingItem = { name: item, t: t0 }
+      try {
+        s.bot.activateItem(dest === 'off-hand')
+        while (Date.now() - t0 < eatLimit && !s.interruptedBy && s.alive) {
+          requireConnected(s)
+          await sleep(100)
+          if (s.interruptedBy || !s.alive || !s.bot) break
+          const cur = held()
+          if (!before) { done = true; break }
+          if (!cur || cur.name !== before.name || cur.count < before.count) { done = true; break }
+        }
+      } finally {
+        if (s.bot && s.bot._client?.state === 'play') { try { s.bot.deactivateItem() } catch {} }
+        s.usingItem = null
       }
-      try { s.bot.deactivateItem() } catch {}
-      s.usingItem = null
+      if (!done && (s.interruptedBy || !s.alive)) return {}
       if (!done) {
         fail('timeout', `could not finish using ${item}`, {
           held_before: before,
@@ -3283,7 +3582,7 @@ const api = {
           effects: effectList(s)
         })
       }
-      await sleep(300)
+      await sleepInterruptible(s, 300)
       return {
         used: { name: item, count: 1 },
         food_before: foodBefore, food: s.bot.food,
@@ -3598,4 +3897,4 @@ function patchBrokenPickaxeMaterials(reg) {
 // window_view 会走路并打开界面，要占动作锁，所以不放进只读集合
 const READONLY = new Set(['status', 'inventory', 'find_blocks', 'get_entities', 'events', 'advancements', 'get_block', 'stop', 'connect', 'disconnect', 'posture', 'look'])
 
-module.exports = { configure, Session, sessions, api, READONLY, ApiError, fail, fmt, log, sleep, patchBrokenPickaxeMaterials, scanExposed, createSafeGoto, createMovements }
+module.exports = { configure, Session, sessions, api, READONLY, ApiError, fail, fmt, log, sleep, patchBrokenPickaxeMaterials, scanExposed, createSafeGoto, createMovements, selectBestHarvestTool, weaponScore }

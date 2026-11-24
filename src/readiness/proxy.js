@@ -74,8 +74,12 @@ function prepare (opts, config) {
 }
 
 function create (session, opts, config) {
-  const { server, rcon: rconConfig } = session.route ?? prepare(opts, config)()(session.profile.name)
-  const probe = rconConfig ? rcon.create(rconConfig, config.baseDir) : null
+  const readRoutes = (opts.assignmentsFile && config?.baseDir) ? prepare(opts, config) : null
+  const assignmentsPath = readRoutes ? path.resolve(config.baseDir, opts.assignmentsFile) : null
+  const initialRoute = session.route ?? (readRoutes ? readRoutes()(session.profile.name) : prepare(opts, config)()(session.profile.name))
+  let server = initialRoute.server
+  let probe = initialRoute.rcon ? rcon.create(initialRoute.rcon, config.baseDir) : null
+  let lastFileSig = null
   let bot = null
   let interval = null
   let epoch = 0
@@ -104,6 +108,38 @@ function create (session, opts, config) {
     legacyConfirmed = false
     suspend(next)
     probe?.close()
+  }
+
+  function refreshRoute () {
+    if (!assignmentsPath || !readRoutes) return false
+    let sig
+    try {
+      const st = fs.statSync(assignmentsPath)
+      sig = `${st.mtimeMs}:${st.size}`
+    } catch {
+      return false
+    }
+    if (sig === lastFileSig) return false
+    lastFileSig = sig
+    let next
+    try {
+      next = readRoutes()(session.profile.name)
+    } catch (error) {
+      session.log('GUARD assignments reload failed:', error.message)
+      return false
+    }
+    if (!next || next.server === server) return false
+    const prev = server
+    probe?.close()
+    server = next.server
+    probe = next.rcon ? rcon.create(next.rcon, config.baseDir) : null
+    session.route = next
+    bootstrapSent = false
+    attempts = 0
+    lastSwitchAt = 0
+    reset('switching')
+    session.log('GUARD route updated', prev, '->', server)
+    return true
   }
 
   function confirm (via) {
@@ -140,6 +176,7 @@ function create (session, opts, config) {
 
   async function check () {
     if (!bot?.entity || bot._client.state !== 'play') return
+    refreshRoute()
     if (!probe) {
       if (!legacyConfirmed) switchServer()
       return
@@ -178,7 +215,7 @@ function create (session, opts, config) {
   }
 
   return {
-    server,
+    get server () { return server },
     guardsWorld: true,
     attach (attached) {
       onEnd()
@@ -188,7 +225,14 @@ function create (session, opts, config) {
       lastSwitchAt = 0
       attached._client.on('state', (state, previous) => {
         if (bot !== attached) return
-        if (previous === 'play' && state !== 'play') reset('switching')
+        if (previous === 'play' && state !== 'play') {
+          const wasConfirmed = phase === 'confirmed'
+          reset('switching')
+          // Hold off immediate /server bounce-back when a confirmed bot is transferred away
+          // (e.g. server maintenance evacuation); if assignmentsFile changed, refreshRoute()
+          // clears lastSwitchAt immediately on entering play.
+          if (wasConfirmed) lastSwitchAt = Date.now()
+        }
         if (state === 'play') void check()
       })
       attached.on('spawn', check)
