@@ -1,6 +1,51 @@
 'use strict'
 
 const TO_RADIANS = Math.PI / 180
+// Match Vanilla Shapes.EPSILON (1.0E-7) in prismarine-physics AABB collision checks.
+// Without it, IEEE-754 rounding at wall faces (e.g. (4 + 0.3) - 0.3 < 4) makes computeOffsetY
+// treat an adjacent vertical wall as a floor (mid-air wall-clinging float) and lets computeOffsetX/Z
+// clip straight through walls.
+const COLLISION_EPSILON = 1e-7
+
+function installCollisionEpsilon() {
+  const AABB = require('prismarine-physics/lib/aabb')
+  if (AABB.prototype._mcAgentCollisionEpsilonInstalled) return
+  const eps = COLLISION_EPSILON
+  AABB.prototype.computeOffsetX = function (other, offsetX) {
+    if (other.maxY > this.minY + eps && other.minY < this.maxY - eps &&
+        other.maxZ > this.minZ + eps && other.minZ < this.maxZ - eps) {
+      if (offsetX > 0.0 && other.maxX <= this.minX + eps) {
+        offsetX = Math.max(0.0, Math.min(this.minX - other.maxX, offsetX))
+      } else if (offsetX < 0.0 && other.minX >= this.maxX - eps) {
+        offsetX = Math.min(0.0, Math.max(this.maxX - other.minX, offsetX))
+      }
+    }
+    return offsetX
+  }
+  AABB.prototype.computeOffsetY = function (other, offsetY) {
+    if (other.maxX > this.minX + eps && other.minX < this.maxX - eps &&
+        other.maxZ > this.minZ + eps && other.minZ < this.maxZ - eps) {
+      if (offsetY > 0.0 && other.maxY <= this.minY + eps) {
+        offsetY = Math.max(0.0, Math.min(this.minY - other.maxY, offsetY))
+      } else if (offsetY < 0.0 && other.minY >= this.maxY - eps) {
+        offsetY = Math.min(0.0, Math.max(this.maxY - other.minY, offsetY))
+      }
+    }
+    return offsetY
+  }
+  AABB.prototype.computeOffsetZ = function (other, offsetZ) {
+    if (other.maxX > this.minX + eps && other.minX < this.maxX - eps &&
+        other.maxY > this.minY + eps && other.minY < this.maxY - eps) {
+      if (offsetZ > 0.0 && other.maxZ <= this.minZ + eps) {
+        offsetZ = Math.max(0.0, Math.min(this.minZ - other.maxZ, offsetZ))
+      } else if (offsetZ < 0.0 && other.minZ >= this.maxZ - eps) {
+        offsetZ = Math.min(0.0, Math.max(this.maxZ - other.minZ, offsetZ))
+      }
+    }
+    return offsetZ
+  }
+  AABB.prototype._mcAgentCollisionEpsilonInstalled = true
+}
 
 function installFishingPull(bot, bobber) {
   const hookedIndex = bobber?.metadataKeys?.indexOf('hooked_entity') ?? -1
@@ -73,6 +118,7 @@ function installTeleportVelocity(bot) {
 }
 
 function installMovementCompatibility(bot) {
+  installCollisionEpsilon()
   const data = require('minecraft-data')(bot.version)
   if (!data) return
   installFishingPull(bot, data.entitiesByName.fishing_bobber)
@@ -80,4 +126,4 @@ function installMovementCompatibility(bot) {
   if (positionFields?.some(field => field.name === 'dx')) installTeleportVelocity(bot)
 }
 
-module.exports = { installMovementCompatibility }
+module.exports = { installMovementCompatibility, installCollisionEpsilon }

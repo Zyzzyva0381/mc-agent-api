@@ -445,7 +445,9 @@ class Session {
       }, 4000).unref()
     })
     s.bot.once('spawn', () => {
-      s.bot.physics.playerHalfWidth = 0.3001
+      // 保持与原版服务端一致的 0.3 半宽（0.6 碰撞箱）；配合 movement-compat 里的 1e-7 碰撞容差，
+      // 既防 IEEE-754 穿墙，又避免 0.3001 在服务端贴墙坐标（wall±0.3）下把垂直墙面当脚底导致半空浮空。
+      s.bot.physics.playerHalfWidth = 0.3
       s.mcData = require('minecraft-data')(s.bot.version)
       patchBrokenPickaxeMaterials(s.mcData)
       patchBrokenPickaxeMaterials(s.bot.registry)
@@ -467,14 +469,21 @@ class Session {
     // 换完世界后约 0.25 s 内 get_block 会 not_loaded、get_entities 为空
     let hasSpawned = false
     let waitingGen = -1
+    let positionedGen = -1
+    const maybeEnablePhysics = () => {
+      if (s.bot !== worldBot || worldBot.physicsEnabled || positionedGen !== s.worldGen) return
+      if (hasLocalPhysicsChunks(worldBot)) worldBot.physicsEnabled = true
+    }
     const resetWorld = () => {
       if (s.bot !== worldBot) return
       s.worldReady = false
       s.worldGen++
+      positionedGen = -1
       worldBot.physicsEnabled = false
     }
     for (const ev of ['login', 'respawn']) worldBot.on(ev, resetWorld)
     worldBot._client.on('state', (state, previous) => { if (previous === 'play' && state !== 'play') resetWorld() })
+    worldBot.on('chunkColumnLoad', maybeEnablePhysics)
     const waitForWorld = async () => {
       if (s.bot !== worldBot || s.worldReady || waitingGen === s.worldGen) return
       const gen = s.worldGen
@@ -495,12 +504,18 @@ class Session {
     }
     worldBot.on('spawn', () => {
       hasSpawned = true
+      maybeEnablePhysics()
       void waitForWorld()
     })
+    // 收到服务端真实 position 后，只要脚下局部区块加载完成就立即恢复物理重力，
+    // 避免等 5x5 全区块（3.5~8s）期间 physicsEnabled=false 导致人物悬空被踢 "floating too long"。
     // Velocity 切服可能只有 login 和位置同步，Mineflayer 不一定再次触发 spawn。
     worldBot._client.on('position', ({ teleportId }) => {
-      if (s.bot !== worldBot || !hasSpawned || s.worldReady || waitingGen === s.worldGen) return
+      if (s.bot !== worldBot || worldBot._client.state !== 'play') return
       if (!Number.isInteger(teleportId) || teleportId < 0) return
+      positionedGen = s.worldGen
+      maybeEnablePhysics()
+      if (!hasSpawned || s.worldReady || waitingGen === s.worldGen) return
       if (worldBot.supportFeature('sendsPlayerLoadedPacket')) worldBot._client.write('player_loaded', {})
       void waitForWorld()
     })
@@ -3683,6 +3698,9 @@ const api = {
         s.log('DISMISS stale vehicle', vehicle.name)
         s.bot.vehicle = null
         s.bot.emit('dismount', vehicle)
+        if (s.bot._client && s.bot._client.state === 'play') {
+          s.bot._client.emit('position', { teleportId: -1, x: 0, y: 0, z: 0, dx: 0, dy: 0, dz: 0, yaw: 0, pitch: 0, flags: { x: true, y: true, z: true, yaw: true, pitch: true, dx: false, dy: false, dz: false } })
+        }
       }
     }
     if (s.bot.vehicle) fail('dismount_failed', `still riding ${vehicle.name}`)
@@ -3894,7 +3912,27 @@ function patchBrokenPickaxeMaterials(reg) {
   return patched
 }
 
+// 判断 bot 脚下碰撞箱覆盖的局部区块是否已加载（最多 1~4 个区块），用于在 5x5 区块到齐前提前恢复重力。
+function hasLocalPhysicsChunks(bot) {
+  if (!bot || bot._client?.state !== 'play' || !bot.entity?.position || !bot.world) return false
+  const pos = bot.entity.position
+  if (!Number.isFinite(pos.x) || !Number.isFinite(pos.y) || !Number.isFinite(pos.z)) return false
+  if (typeof bot.world.getColumn === 'function') {
+    const r = (bot.physics && Number.isFinite(bot.physics.playerHalfWidth) ? bot.physics.playerHalfWidth : 0.3) + 0.05
+    const minCx = Math.floor(pos.x - r) >> 4
+    const maxCx = Math.floor(pos.x + r) >> 4
+    const minCz = Math.floor(pos.z - r) >> 4
+    const maxCz = Math.floor(pos.z + r) >> 4
+    for (let cx = minCx; cx <= maxCx; cx++) {
+      for (let cz = minCz; cz <= maxCz; cz++) {
+        if (!bot.world.getColumn(cx, cz)) return false
+      }
+    }
+  }
+  return typeof bot.blockAt === 'function' ? bot.blockAt(pos, false) != null : true
+}
+
 // window_view 会走路并打开界面，要占动作锁，所以不放进只读集合
 const READONLY = new Set(['status', 'inventory', 'find_blocks', 'get_entities', 'events', 'advancements', 'get_block', 'stop', 'connect', 'disconnect', 'posture', 'look'])
 
-module.exports = { configure, Session, sessions, api, READONLY, ApiError, fail, fmt, log, sleep, patchBrokenPickaxeMaterials, scanExposed, createSafeGoto, createMovements, selectBestHarvestTool, weaponScore }
+module.exports = { configure, Session, sessions, api, READONLY, ApiError, fail, fmt, log, sleep, patchBrokenPickaxeMaterials, scanExposed, createSafeGoto, createMovements, selectBestHarvestTool, weaponScore, hasLocalPhysicsChunks }
