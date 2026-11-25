@@ -2711,7 +2711,10 @@ const api = {
   },
   async advancements(s, { status = 'all', include_recipes = false, namespace, ids, include_criteria = true } = {}) {
     if (!s.bot) fail('not_connected', 'bot not connected')
-    if (!s.isReady()) fail('wrong_server', 'bot is not ready on the target server')
+    if (!s.isReady()) {
+      const err = readinessError(s)
+      fail(err.code, err.message)
+    }
     if (!s.advancementsReady) fail('not_ready', 'advancement data has not arrived yet')
     if (!['all', 'completed', 'in_progress', 'not_started'].includes(status)) fail('bad_args', 'status must be all, completed, in_progress, or not_started')
     if (namespace !== undefined && (typeof namespace !== 'string' || !namespace.length)) fail('bad_args', 'namespace must be a non-empty string')
@@ -3934,7 +3937,16 @@ function hasLocalPhysicsChunks(bot) {
   return typeof bot.blockAt === 'function' ? bot.blockAt(pos, false) != null : true
 }
 
+// 统一的就绪错误口径（dispatch.js 与直连模式下的 /advancements 共用）：
+// 区分后端失联（backend_unavailable）、目标服加载区块中（not_ready）与尚未在目标服（wrong_server）。
+function readinessError(session) {
+  const state = session.readiness?.guardsWorld ? session.readiness.state() : null
+  if (state === 'backend_unavailable') return { code: 'backend_unavailable', message: 'cannot confirm player presence on the target server' }
+  if (session.bot && session.readiness?.isReady() && !session.worldReady) return { code: 'not_ready', message: 'world is still loading; retry in a moment' }
+  return { code: 'wrong_server', message: 'bot is not ready on the target server' }
+}
+
 // window_view 会走路并打开界面，要占动作锁，所以不放进只读集合
 const READONLY = new Set(['status', 'inventory', 'find_blocks', 'get_entities', 'events', 'advancements', 'get_block', 'stop', 'connect', 'disconnect', 'posture', 'look'])
 
-module.exports = { configure, Session, sessions, api, READONLY, ApiError, fail, fmt, log, sleep, patchBrokenPickaxeMaterials, scanExposed, createSafeGoto, createMovements, selectBestHarvestTool, weaponScore, hasLocalPhysicsChunks }
+module.exports = { configure, Session, sessions, api, READONLY, ApiError, fail, fmt, log, sleep, patchBrokenPickaxeMaterials, scanExposed, createSafeGoto, createMovements, selectBestHarvestTool, weaponScore, hasLocalPhysicsChunks, readinessError }

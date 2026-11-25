@@ -478,3 +478,28 @@ test('#13 & #16 http.js preserves null in pos array and closes companion IPv6 se
   // Verify server.close() cleanly closes without hanging on a leaked IPv6 listener
   assert.ok(server.address().port > 0)
 })
+
+test('advancements returns not_ready (not wrong_server) in direct mode while reloading chunks after respawn', async () => {
+  configure({ config: {}, createReadiness: () => ({ guardsWorld: false, isReady: () => true }) })
+  const s = new Session('tok', 'DirectBot', { name: 'DirectBot', id: '0000' }, {})
+  s.bot = { entity: { position: new Vec3(0, 64, 0) } }
+  s.advancementsReady = true
+  s.worldReady = false
+
+  // Direct mode reloading chunks -> must return retryable not_ready, matching dispatch.js readinessError()
+  const res = await dispatch(s, 'advancements', {})
+  assert.equal(res.body.ok, false)
+  assert.equal(res.body.error.code, 'not_ready')
+
+  // When not on target server yet (readiness.isReady() === false) -> still wrong_server
+  s.readiness = { guardsWorld: false, isReady: () => false }
+  const res2 = await dispatch(s, 'advancements', {})
+  assert.equal(res2.body.ok, false)
+  assert.equal(res2.body.error.code, 'wrong_server')
+
+  // Once worldReady is restored -> succeeds
+  s.readiness = { guardsWorld: false, isReady: () => true }
+  s.worldReady = true
+  const res3 = await dispatch(s, 'advancements', {})
+  assert.equal(res3.body.ok, true)
+})

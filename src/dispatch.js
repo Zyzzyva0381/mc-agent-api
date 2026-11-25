@@ -1,19 +1,12 @@
 'use strict'
 // 一次 API 调用在 bot 进程里的完整处理：动作锁、就绪 / 死亡守卫、stop_on、错误归一。
 // 以前写在 http.js 里；现在每个 bot 跑在自己的子进程（src/worker.js），HTTP 主进程只负责认证和转发。
-const { api, READONLY, ApiError, fmt } = require('./session')
+const { api, READONLY, ApiError, fmt, readinessError } = require('./session')
 
 // 这些观察接口要用到世界 / 实体；重连途中 bot 对象已建好但世界还没装上，以前会报
 // internal "Cannot read properties of undefined (reading 'getBlock' / 'position')"
 const NEED_WORLD = new Set(['get_block', 'find_blocks', 'get_entities', 'inventory'])
 const PROXY_WORLD_ENDPOINTS = new Set([...NEED_WORLD, 'advancements', 'posture', 'look'])
-
-function readinessError (session) {
-  const state = session.readiness.guardsWorld ? session.readiness.state() : null
-  if (state === 'backend_unavailable') return { code: 'backend_unavailable', message: 'cannot confirm player presence on the target server' }
-  if (session.bot && session.readiness.isReady() && !session.worldReady) return { code: 'not_ready', message: 'world is still loading; retry in a moment' }
-  return { code: 'wrong_server', message: 'bot is not ready on the target server' }
-}
 
 // 返回 { status, body }：status 是 HTTP 状态码，body 是响应 JSON
 async function dispatch (session, name, args) {
