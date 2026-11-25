@@ -445,9 +445,11 @@ class Session {
       }, 4000).unref()
     })
     s.bot.once('spawn', () => {
-      // 保持与原版服务端一致的 0.3 半宽（0.6 碰撞箱）；配合 movement-compat 里的 1e-7 碰撞容差，
-      // 既防 IEEE-754 穿墙，又避免 0.3001 在服务端贴墙坐标（wall±0.3）下把垂直墙面当脚底导致半空浮空。
-      s.bot.physics.playerHalfWidth = 0.3
+      // 原版 Java 服务端用的是 float 0.6f 强转 double 除以 2（0.30000001192092896），不是 double 0.3：
+      // - 用 0.3 会比服务端窄 1.19e-8，贴墙停位时嵌入服务端墙体，脚下挖空会被服务端反复拉回导致半空浮空；
+      // - 用 0.3001 会比服务端宽 1e-4，服务端拉回贴墙坐标时客户端反过来把墙当脚底导致半空浮空。
+      // 与服务端逐 bit 一致的 Math.fround(0.6) / 2 配合 movement-compat 的 1e-7 容差，两端完全对齐。
+      s.bot.physics.playerHalfWidth = Math.fround(0.6) / 2
       s.mcData = require('minecraft-data')(s.bot.version)
       patchBrokenPickaxeMaterials(s.mcData)
       patchBrokenPickaxeMaterials(s.bot.registry)

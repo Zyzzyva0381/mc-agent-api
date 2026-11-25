@@ -120,7 +120,8 @@ test('collision epsilon prevents wall-clinging mid-air float and wall clipping a
       }
     }
     const phys = Physics(mcData, world)
-    phys.playerHalfWidth = 0.3
+    const hw = Math.fround(0.6) / 2
+    phys.playerHalfWidth = hw
     const e = {
       pos: new Vec3(10.5, 65.0, dir === -1 ? wallFace + 0.5 : wallFace - 0.5),
       vel: new Vec3(0, 0, 0), onGround: true, isInWater: false, isInLava: false, isInWeb: false,
@@ -132,8 +133,8 @@ test('collision epsilon prevents wall-clinging mid-air float and wall clipping a
     }
     for (let t = 0; t < 15; t++) {
       phys.simulatePlayer(e, world)
-      if (dir === -1) assert.ok(e.pos.z >= wallFace + 0.3 - 1e-6, `clipped -Z wall at base=${base}: z=${e.pos.z}`)
-      else assert.ok(e.pos.z <= wallFace - 0.3 + 1e-6, `clipped +Z wall at base=${base}: z=${e.pos.z}`)
+      if (dir === -1) assert.ok(e.pos.z >= wallFace + hw - 1e-9, `clipped -Z wall at base=${base}: z=${e.pos.z}`)
+      else assert.ok(e.pos.z <= wallFace - hw + 1e-9, `clipped +Z wall at base=${base}: z=${e.pos.z}`)
     }
     hasFloor = false
     e.control.forward = false
