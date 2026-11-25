@@ -503,3 +503,33 @@ test('advancements returns not_ready (not wrong_server) in direct mode while rel
   const res3 = await dispatch(s, 'advancements', {})
   assert.equal(res3.body.ok, true)
 })
+
+test('auth.allowedUsers rejects unlisted authenticated profiles with 403 forbidden (case-insensitive)', async t => {
+  const authenticate = t.mock.fn(async ({ username }) => ({
+    profile: { id: 'id-' + username, name: username === 'snowy@example.com' ? 'Snowy' : username },
+    botOptions: {}
+  }))
+  web.configure({
+    config: {
+      ...DEFAULTS,
+      http: { host: '127.0.0.1', port: 0, loginRateLimit: { maxFailsPerIp: 10, blockSeconds: 60, maxGlobalPerMinute: 60 } },
+      auth: { type: 'offline', allowedUsers: ['Snowy'] }
+    },
+    authProvider: { authenticate },
+    readRoutes: null
+  })
+  const server = web.start()
+  t.after(() => new Promise(resolve => server.close(resolve)))
+  await once(server, 'listening')
+  const base = `http://127.0.0.1:${server.address().port}/api/v1`
+
+  const denied = await fetch(`${base}/auth/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: 'OtherPlayer', password: 'pw' })
+  })
+  assert.equal(denied.status, 403)
+  const deniedBody = await denied.json()
+  assert.equal(deniedBody.ok, false)
+  assert.equal(deniedBody.error.code, 'forbidden')
+})

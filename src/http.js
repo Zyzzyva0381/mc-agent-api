@@ -13,12 +13,15 @@ const MAX_BODY_BYTES = 1024 * 1024
 let config = null
 let authProvider = null
 let readRoutes = null
+let allowedUsers = null
 const tokenTtlMs = () => config.session.tokenTtlHours * 60 * 60 * 1000
 
 function configure (opts) {
   config = opts.config
   authProvider = opts.authProvider
   readRoutes = opts.readRoutes
+  const list = config?.auth?.allowedUsers
+  allowedUsers = Array.isArray(list) ? new Set(list.map(u => u.trim().toLowerCase())) : null
 }
 
 // ---------- /auth/login 限流 ----------
@@ -136,6 +139,11 @@ async function handleRequest (req, res) {
     try {
       loginAttempts.push(Date.now())
       const { profile, botOptions } = await authProvider.authenticate({ username, password })
+      if (allowedUsers && !allowedUsers.has(String(profile?.name || '').toLowerCase())) {
+        noteLoginFailure(ip)
+        log('LOGIN FORBIDDEN', username, '->', profile?.name, 'from', ip)
+        return send(403, { ok: false, error: { code: 'forbidden', message: 'this user is not allowed on this API instance' } })
+      }
       const route = routeFor && routeFor(profile.name)
       // 同一角色只能有一个 bot 在线：作废旧 session，避免新旧 bot 互踢
       for (const old of [...sessions.values()]) {

@@ -42,6 +42,11 @@ function loadConfig (file) {
     }
   }
   cfg.http.loginRateLimit = rateLimit
+  if (cfg.auth && cfg.auth.allowedUsers !== undefined && cfg.auth.allowedUsers !== null) {
+    if (!Array.isArray(cfg.auth.allowedUsers) || cfg.auth.allowedUsers.some(u => typeof u !== 'string' || !u.trim())) {
+      throw new Error('auth.allowedUsers must be an array of non-empty strings')
+    }
+  }
   cfg.baseDir = path.dirname(p)
   cfg.configPath = p
   if (process.env.MC_AGENT_PORT) cfg.http.port = Number(process.env.MC_AGENT_PORT)
