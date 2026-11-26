@@ -179,3 +179,133 @@ test('attack stops cleanly without phantom swing if target vanishes during lookA
   assert.equal(res.hit_log.length, 0)
   assert.equal(events.filter(e => e.type === 'attack_hit').length, 0)
 })
+
+function makeWeaponSession({ items, heldItem = null, targetPos = new Vec3(1.8, 64, 0) }) {
+  const equipCalls = []
+  const swungWith = []
+  const events = []
+  const bot = {
+    health: 20,
+    heldItem,
+    entity: { position: new Vec3(0, 64, 0), eyeHeight: 1.62 },
+    entities: {
+      42: { id: 42, name: 'zombie', isValid: true, height: 1.95, position: targetPos },
+    },
+    inventory: { items: () => items },
+    equip: async (item) => {
+      equipCalls.push(item)
+      bot.heldItem = item
+    },
+    lookAt: async () => {},
+    attack: () => { swungWith.push(bot.heldItem ? { name: bot.heldItem.name, slot: bot.heldItem.slot } : null) },
+    blockAtCursor: () => null,
+    pathfinder: { setGoal: () => {} },
+  }
+  const s = {
+    bot,
+    interruptedBy: null,
+    pushEvent: (type, data) => events.push({ type, data }),
+  }
+  return { s, bot, equipCalls, swungWith, events }
+}
+
+test('attack auto weapon selection keeps diamond_sword over earlier-slot stone_sword in both chase modes and reports weapon', async () => {
+  for (const chase of [false, true]) {
+    const stone = { name: 'stone_sword', slot: 14, count: 1 }
+    const diamond = { name: 'diamond_sword', slot: 37, count: 1 }
+    const iron = { name: 'iron_sword', slot: 41, count: 1 }
+    const { s, equipCalls, swungWith, events } = makeWeaponSession({
+      items: [stone, diamond, iron],
+      heldItem: diamond,
+    })
+    const res = await api.attack(s, { entity_id: 42, max_hits: 1, interval_ms: 50, chase, feedback: true })
+    assert.equal(equipCalls.length, 0, `should not re-equip when best diamond_sword is already held (chase=${chase})`)
+    assert.deepEqual(swungWith, [{ name: 'diamond_sword', slot: 37 }])
+    assert.equal(res.weapon, 'diamond_sword')
+    assert.equal(res.hit_log[0].weapon, 'diamond_sword')
+    assert.equal(events[0].data.weapon, 'diamond_sword')
+  }
+})
+
+test('attack auto tie-breaker preserves currently held equal-DPS sword instead of overwriting with earlier slot', async () => {
+  const plainEarly = { name: 'diamond_sword', slot: 14, count: 1, maxDurability: 1561, durabilityUsed: 0 }
+  const lootingHeld = { name: 'diamond_sword', slot: 37, count: 1, enchants: [{ name: 'looting', lvl: 3 }], maxDurability: 1561, durabilityUsed: 50 }
+  const { s, equipCalls, swungWith } = makeWeaponSession({
+    items: [plainEarly, lootingHeld],
+    heldItem: lootingHeld,
+  })
+  const res = await api.attack(s, { entity_id: 42, max_hits: 1, interval_ms: 50, chase: false })
+  assert.equal(equipCalls.length, 0)
+  assert.deepEqual(swungWith, [{ name: 'diamond_sword', slot: 37 }])
+  assert.equal(res.weapon, 'diamond_sword')
+
+  // When holding empty hand, equal-DPS candidates prefer combat enchants then higher remaining durability
+  const lowDur = { name: 'diamond_sword', slot: 10, count: 1, maxDurability: 1561, durabilityUsed: 1500 }
+  const highDur = { name: 'diamond_sword', slot: 20, count: 1, maxDurability: 1561, durabilityUsed: 10 }
+  const emptyHand = makeWeaponSession({ items: [lowDur, highDur], heldItem: null })
+  await api.attack(emptyHand.s, { entity_id: 42, max_hits: 1, interval_ms: 50, chase: false })
+  assert.deepEqual(emptyHand.swungWith, [{ name: 'diamond_sword', slot: 20 }])
+
+  const withEnch = makeWeaponSession({ items: [plainEarly, lootingHeld], heldItem: null })
+  await api.attack(withEnch.s, { entity_id: 42, max_hits: 1, interval_ms: 50, chase: false })
+  assert.deepEqual(withEnch.swungWith, [{ name: 'diamond_sword', slot: 37 }])
+})
+
+test('attack with weapon=hand preserves equipped axe or bare hand without calling equip', async () => {
+  const sword = { name: 'netherite_sword', slot: 14, count: 1 }
+  const axe = { name: 'diamond_axe', slot: 37, count: 1 }
+  const heldAxe = makeWeaponSession({ items: [sword, axe], heldItem: axe })
+  const resAxe = await api.attack(heldAxe.s, { entity_id: 42, max_hits: 1, chase: false, feedback: true, weapon: 'hand' })
+  assert.equal(heldAxe.equipCalls.length, 0)
+  assert.deepEqual(heldAxe.swungWith, [{ name: 'diamond_axe', slot: 37 }])
+  assert.equal(resAxe.weapon, 'diamond_axe')
+  assert.equal(resAxe.interval_ms, 1000)
+  assert.equal(resAxe.hit_log[0].weapon, 'diamond_axe')
+
+  const bareHand = makeWeaponSession({ items: [sword], heldItem: null })
+  const resBare = await api.attack(bareHand.s, { entity_id: 42, max_hits: 1, chase: false, feedback: true, weapon: 'hand' })
+  assert.equal(bareHand.equipCalls.length, 0)
+  assert.deepEqual(bareHand.swungWith, [null])
+  assert.equal(resBare.weapon, null)
+  assert.equal(resBare.interval_ms, 250)
+  assert.equal(resBare.hit_log[0].weapon, null)
+})
+
+test('attack with explicit weapon name equips requested weapon and rejects missing or invalid weapon', async () => {
+  const sword = { name: 'diamond_sword', slot: 14, count: 1 }
+  const axe = { name: 'diamond_axe', slot: 36, count: 1 }
+  const trident = { name: 'trident', slot: 38, count: 1 }
+  const { s, equipCalls, swungWith } = makeWeaponSession({ items: [sword, axe, trident], heldItem: sword })
+
+  const res = await api.attack(s, { entity_id: 42, max_hits: 1, chase: false, weapon: 'diamond_axe' })
+  assert.equal(equipCalls.length, 1)
+  assert.equal(equipCalls[0].name, 'diamond_axe')
+  assert.deepEqual(swungWith, [{ name: 'diamond_axe', slot: 36 }])
+  assert.equal(res.weapon, 'diamond_axe')
+  assert.equal(res.interval_ms, 1000)
+
+  const resTri = await api.attack(s, { entity_id: 42, max_hits: 1, chase: true, weapon: 'trident' })
+  assert.equal(resTri.weapon, 'trident')
+  assert.equal(resTri.interval_ms, 909)
+
+  await assert.rejects(
+    () => api.attack(s, { entity_id: 42, max_hits: 1, chase: false, weapon: 'netherite_axe' }),
+    err => err && err.code === 'missing_item',
+  )
+  for (const bad of ['', '   ', 123, null, true]) {
+    await assert.rejects(
+      () => api.attack(s, { entity_id: 42, max_hits: 1, chase: false, weapon: bad }),
+      err => err && err.code === 'bad_args',
+    )
+  }
+})
+
+test('attack with weapon=auto upgrades from held stone_sword to diamond_sword in inventory', async () => {
+  const stone = { name: 'stone_sword', slot: 37, count: 1 }
+  const diamond = { name: 'diamond_sword', slot: 14, count: 1 }
+  const { s, equipCalls, swungWith } = makeWeaponSession({ items: [diamond, stone], heldItem: stone })
+  const res = await api.attack(s, { entity_id: 42, max_hits: 1, interval_ms: 50, chase: false, weapon: 'auto' })
+  assert.equal(equipCalls.length, 1)
+  assert.deepEqual(swungWith, [{ name: 'diamond_sword', slot: 14 }])
+  assert.equal(res.weapon, 'diamond_sword')
+})

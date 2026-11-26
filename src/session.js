@@ -1201,13 +1201,62 @@ function selectBestHarvestTool (bot, block) {
 
 const WEAPON_BASE_DAMAGE = {
   wooden_sword: 4, golden_sword: 4, stone_sword: 5, copper_sword: 5, iron_sword: 6, diamond_sword: 7, netherite_sword: 8,
-  wooden_axe: 7, golden_axe: 7, stone_axe: 9, copper_axe: 7, iron_axe: 9, diamond_axe: 9, netherite_axe: 10
+  wooden_axe: 7, golden_axe: 7, stone_axe: 9, copper_axe: 7, iron_axe: 9, diamond_axe: 9, netherite_axe: 10,
+  trident: 9, mace: 6
+}
+const COMBAT_ENCHANTS = new Set([
+  'sharpness', 'smite', 'bane_of_arthropods', 'fire_aspect', 'knockback',
+  'looting', 'sweeping_edge', 'impaling', 'density', 'breach', 'wind_burst',
+  'unbreaking', 'mending'
+])
+function isMeleeWeapon (item) {
+  return !!(item && (/_sword$|_axe$/.test(item.name) || item.name === 'trident' || item.name === 'mace'))
 }
 function weaponScore (item) {
   const base = WEAPON_BASE_DAMAGE[item.name] || 1
   const sharp = itemEnchantments(item).find(e => e.name === 'sharpness')
   const dmg = base + (sharp ? 0.5 * sharp.lvl + 0.5 : 0)
   return dmg * (1000 / attackIntervalMs(item))
+}
+function weaponEnchantRank (item) {
+  return itemEnchantments(item).reduce((sum, e) => sum + (COMBAT_ENCHANTS.has(e.name) ? (e.lvl || 1) : 0), 0)
+}
+function weaponDurabilityLeft (item) {
+  if (!item || typeof item.maxDurability !== 'number') return -1
+  return item.maxDurability - (item.durabilityUsed || 0)
+}
+function sameItemInstance (a, b) {
+  if (!a || !b) return false
+  if (a === b) return true
+  return a.slot !== undefined && b.slot !== undefined && a.slot === b.slot && a.name === b.name
+}
+function compareWeapons (a, b, heldItem) {
+  const scoreDiff = weaponScore(b) - weaponScore(a)
+  if (Math.abs(scoreDiff) > 1e-9) return scoreDiff
+  // 同分优先保留当前主手，避免背包前槽位的同级武器覆盖显式装备的武器
+  const aHeld = sameItemInstance(a, heldItem) ? 1 : 0
+  const bHeld = sameItemInstance(b, heldItem) ? 1 : 0
+  if (aHeld !== bHeld) return bHeld - aHeld
+  const enchDiff = weaponEnchantRank(b) - weaponEnchantRank(a)
+  if (enchDiff !== 0) return enchDiff
+  const durDiff = weaponDurabilityLeft(b) - weaponDurabilityLeft(a)
+  if (durDiff !== 0) return durDiff
+  return 0
+}
+function selectAttackWeapon (bot, weaponOpt) {
+  const held = bot.heldItem || null
+  if (weaponOpt === 'hand') return { item: held, equip: false }
+  const items = bot.inventory.items()
+  if (weaponOpt === undefined || weaponOpt === 'auto') {
+    const best = items.filter(isMeleeWeapon).sort((a, b) => compareWeapons(a, b, held))[0] || null
+    if (!best) return { item: held, equip: false }
+    if (sameItemInstance(best, held)) return { item: held, equip: false }
+    return { item: best, equip: true }
+  }
+  if (held && held.name === weaponOpt) return { item: held, equip: false }
+  const picked = items.filter(i => i.name === weaponOpt).sort((a, b) => compareWeapons(a, b, held))[0] || null
+  if (!picked) fail('missing_item', `no ${weaponOpt} in inventory`)
+  return { item: picked, equip: !sameItemInstance(picked, held) }
 }
 
 async function driveVehicle(s, tx, tz, range, timeout) {
@@ -3045,7 +3094,7 @@ const api = {
   // max_hits 用于"打一下就走"（风筝苦力怕、单次敲船/矿车）；
   // chase=false 用于原地站桩挥击（1x2 窄矿道/门洞近战防身，不开 GoalFollow 乱跑）；
   // feedback=true 开启逐次挥击回执 hit_log、stop_reason 与 attack_hit 事件（默认 false 保持旧版返回完全兼容）。
-  async attack(s, { entity_id, timeout, max_hits, interval_ms, chase = true, feedback = false }) {
+  async attack(s, { entity_id, timeout, max_hits, interval_ms, chase = true, feedback = false, weapon }) {
     const bot = requireConnected(s)
     const e = bot.entities[entity_id]
     if (!e) fail('no_such_entity', `entity ${entity_id} not visible`)
@@ -3054,12 +3103,15 @@ const api = {
     if (typeof chase !== 'boolean') fail('bad_args', 'chase must be a boolean')
     if (typeof feedback !== 'boolean') fail('bad_args', 'feedback must be a boolean')
     if (timeout !== undefined && (!Number.isFinite(timeout) || timeout < 50 || timeout > 60000)) fail('bad_args', 'timeout must be between 50 and 60000')
+    if (weapon !== undefined && (typeof weapon !== 'string' || !weapon.trim())) fail('bad_args', 'weapon must be a non-empty string')
+    const weaponOpt = weapon === undefined ? undefined : weapon.trim()
     const effTimeout = timeout === undefined ? (chase ? 20000 : 1500) : timeout
-    const weapon = bot.inventory.items().filter(i => /_sword$|_axe$/.test(i.name)).sort((a, b) => weaponScore(b) - weaponScore(a))[0]
-    if (weapon) await bot.equip(weapon, 'hand')
+    const chosen = selectAttackWeapon(bot, weaponOpt)
+    if (chosen.equip && chosen.item) await bot.equip(chosen.item, 'hand')
     requireConnected(s, bot)
     const interval = interval_ms ?? attackIntervalMs(bot.heldItem)
     const t0 = Date.now(); let hits = 0
+    let lastSwingWeapon
     const hit_log = feedback ? [] : null
     let stop_reason = null
     let blocking_block = null
@@ -3105,13 +3157,16 @@ const api = {
               }
             }
           }
+          const swingWeapon = bot.heldItem ? bot.heldItem.name : null
           bot.attack(e); hits++
+          lastSwingWeapon = swingWeapon
           if (feedback) {
             const hitDist = e.position.distanceTo(bot.entity.position)
             const rec = {
               hit: hits,
               t_ms: Date.now() - t0,
               entity_id: e.id ?? entity_id,
+              weapon: swingWeapon,
               dist: +hitDist.toFixed(2),
               target_pos: [+e.position.x.toFixed(2), +e.position.y.toFixed(2), +e.position.z.toFixed(2)],
               bot_hp: bot.health !== undefined ? +bot.health.toFixed(1) : null,
@@ -3143,7 +3198,8 @@ const api = {
     }
     if (killed && chase) await collectDrops(s, e.position, 5)
     requireConnected(s, bot)
-    const base = { killed, hits, interval_ms: interval, ms: Date.now() - t0, inventory: invCounts(bot) }
+    const usedWeapon = lastSwingWeapon !== undefined ? lastSwingWeapon : (bot.heldItem ? bot.heldItem.name : null)
+    const base = { killed, hits, weapon: usedWeapon, interval_ms: interval, ms: Date.now() - t0, inventory: invCounts(bot) }
     if (!feedback && chase) return base
     return {
       ...base,
@@ -3949,4 +4005,4 @@ function readinessError(session) {
 // window_view 会走路并打开界面，要占动作锁，所以不放进只读集合
 const READONLY = new Set(['status', 'inventory', 'find_blocks', 'get_entities', 'events', 'advancements', 'get_block', 'stop', 'connect', 'disconnect', 'posture', 'look'])
 
-module.exports = { configure, Session, sessions, api, READONLY, ApiError, fail, fmt, log, sleep, patchBrokenPickaxeMaterials, scanExposed, createSafeGoto, createMovements, selectBestHarvestTool, weaponScore, hasLocalPhysicsChunks, readinessError }
+module.exports = { configure, Session, sessions, api, READONLY, ApiError, fail, fmt, log, sleep, patchBrokenPickaxeMaterials, scanExposed, createSafeGoto, createMovements, selectBestHarvestTool, weaponScore, compareWeapons, selectAttackWeapon, hasLocalPhysicsChunks, readinessError }

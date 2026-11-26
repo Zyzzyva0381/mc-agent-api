@@ -342,7 +342,7 @@ POST /events  {"since": 41, "limit": 50}
 | `sleep` / `wake` | 无 |
 | `vehicle` | `action`（`mount`/`dismount`）、`name` |
 | `kicked` / `disconnected` | `reason` |
-| `attack_hit` | `hit`、`t_ms`、`entity_id`、`dist`、`target_pos`、`bot_hp`、可选 `occluded`（仅 `/attack` 传 `feedback: true` 时推送） |
+| `attack_hit` | `hit`、`t_ms`、`entity_id`、`weapon`（发起挥击时的主手物品名，空手为 `null`）、`dist`、`target_pos`、`bot_hp`、可选 `occluded`（仅 `/attack` 传 `feedback: true` 时推送） |
 | `server_confirmed` | `via`（以及适配器给出的 `server` 等） |
 
 ### 3.7 进度
@@ -522,17 +522,23 @@ POST /use_item  {"item": "oak_boat", "target": {"pos": [14, 64, 10]}}
 ```
 POST /attack  {"entity_id": 812}
 POST /attack  {"entity_id": 812, "max_hits": 1}
+POST /attack  {"entity_id": 812, "max_hits": 1, "weapon": "hand"}
+POST /attack  {"entity_id": 812, "max_hits": 1, "weapon": "diamond_axe"}
 POST /attack  {"entity_id": 812, "max_hits": 1, "chase": false, "feedback": true}
 POST /attack  {"entity_id": 812, "max_hits": 5, "interval_ms": 300}
 ```
 
+- `weapon`（默认 `"auto"`）：控制挥击前主手武器的选择策略：
+  - `"auto"`（或不传）：从背包中的剑、斧、三叉戟、重锤中自动选取最佳武器；按 DPS（基础伤害 + 锋利附魔 ÷ 攻击间隔）排序，同分时**优先保留当前主手已装备的物品**，其次比较战斗附魔总等级、剩余耐久，最后按槽位顺序。背包无近战武器时保持当前主手不变；
+  - `"hand"`：严格保留当前主手物品（含空手），不自动切换武器；
+  - 具体物品名（如 `"diamond_axe"`、`"trident"`、`"mace"`）：若当前主手已是该物品则保留，否则从背包选择最优同款装备，背包中不存在时返回 `missing_item`。
 - 挥击间隔默认按手持物品的原版攻速计算：空手和非工具物品 250ms、剑 625ms、镐 833ms、锹 1000ms、斧 1000–1250ms、锄 250–1000ms（按材质）、三叉戟 909ms、重锤 1667ms（空手拆船/拆矿车需要 250ms，固定 650ms 会被船的每 tick 自愈抵消）；
 - `max_hits`：打够这么多下立刻返回，用于"砍一下就走"（风筝苦力怕、单次敲击）；
 - `interval_ms`：手动覆盖挥击间隔（50–5000）；
 - `chase`（默认 `true`）：设为 `false` 时**原地站桩面向目标挥击**，不启动 `GoalFollow` 寻路追击，击杀后也**不会自动移动捡掉落物**（适合 1×2 窄矿道、门洞贴脸防身）；未传 `timeout` 时默认守点窗口 `1500ms`（可按需传入 `timeout` 范围 `50`–`60000`ms 等待怪物走进射程）；若校验目标 `0.8` 高度与 `0.5` 高度两条射线均被实心方块遮挡，会**立即返回 `blocked_by_wall`**（不继续等待 `timeout` 窗口），窗口结束仍够不到时返回 `out_of_reach`；
-- `feedback`（默认 `false`）：设为 `true` 时在返回体中附带逐次挥击回执 `hit_log`（含 `hit`、`t_ms`、`entity_id`、`dist`、`target_pos`、`bot_hp`，遮挡时附带 `occluded: true`）和 `stop_reason`，同时推送 `attack_hit` 事件供 `/events` 实时观测；注意 `hit_log` / `attack_hit` 记录的是**客户端发起挥击回执**而非服务端伤害确认（`chase: true, feedback: true` 且目标被遮挡时，仍会按原版逻辑发起挥击并记录带 `occluded: true` 的回执）；默认 `false` 时保持与旧版完全一致的返回格式和事件流。
+- `feedback`（默认 `false`）：设为 `true` 时在返回体中附带逐次挥击回执 `hit_log`（含 `hit`、`t_ms`、`entity_id`、`weapon`、`dist`、`target_pos`、`bot_hp`，遮挡时附带 `occluded: true`）和 `stop_reason`，同时推送 `attack_hit` 事件供 `/events` 实时观测；注意 `hit_log` / `attack_hit` 记录的是**客户端发起挥击时的主手武器与回执**而非服务端伤害确认（`chase: true, feedback: true` 且目标被遮挡时，仍会按原版逻辑发起挥击并记录带 `occluded: true` 的回执）；默认 `false` 时保持与旧版完全一致的事件流。
 
-`/attack` 会自动寻路贴近、自动瞄准、自动换上剑/斧。需要自己控制方向、站位和节奏（跳劈暴击、隔缝挥砍、朝固定方向打）时，改用 `POST /control {"hit": ...}`，见 §4.16。
+`/attack` 默认自动寻路贴近、自动瞄准、自动换上最佳近战武器；需要自己控制方向、站位和节奏（跳劈暴击、隔缝挥砍、朝固定方向打）时，改用 `POST /control {"hit": ...}`，见 §4.16。
 
 
 ```
@@ -540,10 +546,10 @@ POST /attack  {"entity_id": 12345, "timeout": 20000}
 ```
 
 ```json
-{"ok": true, "result": {"killed": true, "hits": 7, "ms": 5200, "inventory": {"rotten_flesh": 2}}}
+{"ok": true, "result": {"killed": true, "hits": 7, "weapon": "diamond_sword", "interval_ms": 625, "ms": 5200, "inventory": {"rotten_flesh": 2}}}
 ```
 
-跟随攻击直到目标死亡或超时；自动换近战武器、自动捡掉落。
+跟随攻击直到目标死亡或超时；返回体中的 `weapon` 为发起挥击时实际持有的主手物品名（空手为 `null`）。
 
 ### 4.7 远程攻击
 
