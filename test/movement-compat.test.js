@@ -8,7 +8,7 @@ const registry = require('prismarine-registry')
 const injectPhysics = require('mineflayer/lib/plugins/physics')
 const { Vec3 } = require('vec3')
 const { Physics } = require('prismarine-physics')
-const { installMovementCompatibility, installCollisionEpsilon } = require('../src/movement-compat')
+const { installMovementCompatibility, installCollisionEpsilon, installEffectLifecycle } = require('../src/movement-compat')
 const { hasLocalPhysicsChunks } = require('../src/session')
 
 function fixture(version = '1.21.11') {
@@ -188,4 +188,58 @@ test('hasLocalPhysicsChunks checks only chunks under the player hitbox (includin
   // Outside play state must return false
   bot._client.state = 'configuration'
   assert.equal(hasLocalPhysicsChunks(bot), false)
+})
+
+test('effect lifecycle clears stale effects on respawn and leaving play state', () => {
+  const bot = fixture()
+  bot.entity.effects = { 24: { id: 24, amplifier: 0, duration: 200 } }
+  const ended = []
+  bot.on('entityEffectEnd', (e, eff) => ended.push({ e, eff }))
+  installEffectLifecycle(bot)
+
+  bot.emit('respawn')
+  assert.deepEqual(bot.entity.effects, {})
+  assert.equal(ended.length, 0)
+
+  bot.entity.effects[24] = { id: 24, amplifier: 0, duration: 150 }
+  bot._client.emit('state', 'configuration')
+  assert.deepEqual(bot.entity.effects, {})
+  assert.equal(ended.length, 0)
+})
+
+test('effect lifecycle counts down finite durations, respects TPS grace window, refreshes on re-hit, and preserves infinite effects', () => {
+  const bot = fixture()
+  bot.entity.effects = {
+    24: { id: 24, amplifier: 0, duration: 200 }, // Levitation 10s -> graceTicks = 50
+    16: { id: 16, amplifier: 0, duration: -1 }   // Infinite Night Vision
+  }
+  const ended = []
+  bot.on('entityEffectEnd', (entity, eff) => ended.push({ entity, id: eff.id, duration: eff.duration }))
+  installEffectLifecycle(bot)
+
+  // Tick 100 times (5s): duration counts down to 100, infinite stays -1
+  for (let i = 0; i < 100; i++) bot.emit('physicsTick')
+  assert.equal(bot.entity.effects[24].duration, 100)
+  assert.equal(bot.entity.effects[16].duration, -1)
+  assert.equal(ended.length, 0)
+
+  // Second shulker hit replaces the effect object -> resets countdown and grace window
+  bot.entity.effects[24] = { id: 24, amplifier: 0, duration: 200 }
+  for (let i = 0; i < 200; i++) bot.emit('physicsTick')
+  assert.equal(bot.entity.effects[24].duration, 0)
+  assert.equal(ended.length, 0)
+
+  // Hold through 49 overdue ticks (TPS lag buffer)
+  for (let i = 0; i < 49; i++) bot.emit('physicsTick')
+  assert.ok(bot.entity.effects[24])
+  assert.equal(ended.length, 0)
+
+  // 50th overdue tick expires the stuck effect and emits entityEffectEnd
+  bot.emit('physicsTick')
+  assert.equal(bot.entity.effects[24], undefined)
+  assert.deepEqual(ended, [{ entity: bot.entity, id: 24, duration: 0 }])
+
+  // Infinite effect remains untouched even after hundreds of ticks
+  for (let i = 0; i < 300; i++) bot.emit('physicsTick')
+  assert.equal(bot.entity.effects[16].duration, -1)
 })

@@ -6,6 +6,51 @@ const TO_RADIANS = Math.PI / 180
 // treat an adjacent vertical wall as a floor (mid-air wall-clinging float) and lets computeOffsetX/Z
 // clip straight through walls.
 const COLLISION_EPSILON = 1e-7
+const EFFECT_GRACE_MIN_TICKS = 40 // 2 s minimum buffer for server TPS lag / packet jitter
+const EFFECT_GRACE_MAX_TICKS = 200 // 10 s cap so stuck effects still clear promptly if remove_entity_effect is lost
+
+function installEffectLifecycle(bot) {
+  const tracked = new WeakMap()
+
+  const clearOwnEffects = () => {
+    const effects = bot.entity?.effects
+    if (!effects) return
+    for (const id of Object.keys(effects)) delete effects[id]
+  }
+
+  // Vanilla ClientPacketListener.handleRespawn always creates a fresh LocalPlayer with empty
+  // activeEffects; for dimension changes the server immediately re-sends entity_effect packets.
+  // Mineflayer only resets bot.entity on login, never on respawn, so a missed remove_entity_effect
+  // across death/respawn (e.g. Levitation) would otherwise stick forever.
+  bot.on('respawn', clearOwnEffects)
+  bot._client?.on('state', state => { if (state !== 'play') clearOwnEffects() })
+
+  // Mineflayer stores effect.duration once from entity_effect and never ticks it down.
+  // Decrement finite effects (duration >= 0; -1 means infinite in 1.19.4+) on physicsTick so
+  // /status reports remaining duration accurately and stuck effects expire after a TPS-safe grace
+  // window if remove_entity_effect is ever missed.
+  bot.on('physicsTick', () => {
+    const entity = bot.entity
+    const effects = entity?.effects
+    if (!effects) return
+    for (const key of Object.keys(effects)) {
+      const eff = effects[key]
+      if (!eff || !Number.isFinite(eff.duration) || eff.duration < 0) continue
+      let meta = tracked.get(eff)
+      if (!meta) {
+        const graceTicks = Math.min(EFFECT_GRACE_MAX_TICKS, Math.max(EFFECT_GRACE_MIN_TICKS, Math.ceil(eff.duration * 0.25)))
+        meta = { graceTicks, overdueTicks: 0 }
+        tracked.set(eff, meta)
+      }
+      if (eff.duration > 0) {
+        eff.duration--
+      } else if (++meta.overdueTicks >= meta.graceTicks) {
+        delete effects[key]
+        bot.emit('entityEffectEnd', entity, eff)
+      }
+    }
+  })
+}
 
 function installCollisionEpsilon() {
   const AABB = require('prismarine-physics/lib/aabb')
@@ -119,6 +164,7 @@ function installTeleportVelocity(bot) {
 
 function installMovementCompatibility(bot) {
   installCollisionEpsilon()
+  installEffectLifecycle(bot)
   const data = require('minecraft-data')(bot.version)
   if (!data) return
   installFishingPull(bot, data.entitiesByName.fishing_bobber)
@@ -126,4 +172,4 @@ function installMovementCompatibility(bot) {
   if (positionFields?.some(field => field.name === 'dx')) installTeleportVelocity(bot)
 }
 
-module.exports = { installMovementCompatibility, installCollisionEpsilon }
+module.exports = { installMovementCompatibility, installCollisionEpsilon, installEffectLifecycle }
